@@ -127,21 +127,6 @@ public/
     ├── stress-test.sql
     └── wide-single-statement.sql
 ```
-
----
-
-## Why it is useful for open source
-
-Queryviz is small enough to understand quickly, but visual enough to demo well.
-
-That makes it a good project for:
-
-- GitHub screenshots
-- Reddit posts
-- Show HN launches
-- SQL education content
-- README demos that make sense in 10 seconds
-
 ---
 
 ## Next steps
