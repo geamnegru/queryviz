@@ -53,6 +53,38 @@ export interface SqlAnalysis {
   complexityScore: number;
 }
 
+const escapeDotLabel = (value: string) =>
+  value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r?\n/g, '\\n');
+
+const wrapDotLabel = (value: string, width = 46) => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= width) {
+    return normalized;
+  }
+
+  const chunks: string[] = [];
+  let current = '';
+
+  normalized.split(' ').forEach((word) => {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length > width && current) {
+      chunks.push(current);
+      current = word;
+      return;
+    }
+    current = next;
+  });
+
+  if (current) {
+    chunks.push(current);
+  }
+
+  return chunks.join('\\n');
+};
+
 const stripComments = (input: string) =>
   input
     .replace(/\/\*[\s\S]*?\*\//g, ' ')
@@ -436,4 +468,34 @@ export const analyzeSql = (sqlInput: string, preferredStatementIndex?: number): 
     hasAggregation,
     complexityScore,
   };
+};
+
+export const buildGraphvizDot = (analysis: SqlAnalysis) => {
+  const lines: string[] = [
+    'digraph Queryviz {',
+    '  rankdir=LR;',
+    '  graph [pad="0.3", nodesep="0.6", ranksep="1.0"];',
+    '  node [shape=box, style="rounded", fontname="Helvetica"];',
+    '  edge [fontname="Helvetica"];',
+    '',
+  ];
+
+  analysis.tables.forEach((table) => {
+    const role = table.role === 'source' ? 'SOURCE' : 'JOIN';
+    const label = escapeDotLabel(`${table.name}\\nalias: ${table.alias}\\n${role}`);
+    lines.push(`  "${table.alias}" [label="${label}"];`);
+  });
+
+  if (analysis.tables.length > 0 && analysis.joins.length === 0) {
+    lines.push('');
+    lines.push('  // No joins detected in the selected statement.');
+  }
+
+  analysis.joins.forEach((join) => {
+    const label = escapeDotLabel(`${join.type}\\n${wrapDotLabel(join.condition)}`);
+    lines.push(`  "${join.sourceAlias}" -> "${join.targetAlias}" [label="${label}"];`);
+  });
+
+  lines.push('}');
+  return lines.join('\n');
 };

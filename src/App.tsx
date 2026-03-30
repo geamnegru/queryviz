@@ -7,7 +7,14 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import './App.css';
-import { analyzeSql, extractStatements, type JoinRef, type Severity, type TableRef } from './lib/analyzeSql';
+import {
+  analyzeSql,
+  buildGraphvizDot,
+  extractStatements,
+  type JoinRef,
+  type Severity,
+  type TableRef,
+} from './lib/analyzeSql';
 
 const SAMPLE_SQL = `SELECT
   o.id,
@@ -52,6 +59,7 @@ const severityLabel: Record<Severity, string> = {
 };
 
 const summarizeJoin = (join: JoinRef) => `${join.type} ${join.alias} on ${join.condition}`;
+const createDotFileName = (statementIndex: number) => `queryviz-statement-${statementIndex + 1}.dot`;
 
 const summarizeStatement = (statement: string, index: number) => {
   const normalized = statement.replace(/\s+/g, ' ').trim();
@@ -329,6 +337,21 @@ function App() {
     event.target.value = '';
   };
 
+  const handleExportGraphviz = () => {
+    if (!analysis.normalizedSql.trim()) {
+      return;
+    }
+
+    const dot = buildGraphvizDot(analysis);
+    const blob = new Blob([dot], { type: 'text/vnd.graphviz;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = createDotFileName(analysis.analyzedStatementIndex);
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -447,6 +470,9 @@ function App() {
                 </button>
                 <button type="button" onClick={resetView}>
                   Reset view
+                </button>
+                <button type="button" onClick={handleExportGraphviz} disabled={!analysis.normalizedSql.trim()}>
+                  Export DOT
                 </button>
               </div>
             </div>

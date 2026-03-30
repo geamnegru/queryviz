@@ -162,6 +162,13 @@ input:focus-visible {
   cursor: pointer;
 }
 
+.editor-actions button:disabled,
+.canvas-toolbar__controls button:disabled,
+.statement-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .editor-actions button:hover,
 .canvas-toolbar__controls button:hover,
 .statement-item:hover {

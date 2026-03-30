@@ -66,6 +66,7 @@ The current version supports:
 - table and alias detection
 - selected column extraction
 - join graph rendering directly in the browser
+- Graphviz / DOT export for the selected statement
 - pan, zoom, and draggable graph nodes
 - heuristic flags for patterns like `SELECT *`, leading wildcard `LIKE`, and function-wrapped filters
 - large local test files in `public/demo`
