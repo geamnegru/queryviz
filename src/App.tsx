@@ -17,436 +17,94 @@ import {
   detectSqlDialect,
   diagnoseSqlInput,
   extractStatements,
-  SUPPORTED_SQL_DIALECTS,
-  type DerivedRelation,
-  type JoinRef,
-  type Severity,
-  type SqlDiagnostic,
-  type SqlDialectDetection,
-  type SqlDialect,
-  type TableRef,
 } from './lib/analyzeSql';
 import {
   findSchemaTable,
+  findForeignKeyPairMatch,
   getColumnSetCoverage,
   hasForeignKeyMatch,
   parseSchemaInput,
-  type SchemaTableMetadata,
 } from './lib/schemaMetadata';
+import {
+  NODE_HEIGHT,
+  NODE_WIDTH,
+  createEdgePortMap,
+  createNodeLayout,
+} from './lib/graphLayout';
+import {
+  createQueryTitle,
+  createReviewShareUrl,
+  createSavedQueryId,
+  createShareUrl,
+  createWorkspaceStateKey,
+  persistSavedQueries,
+  readSavedQueries,
+  readSharedWorkspace,
+  readWorkspaceViewState,
+  saveWorkspaceViewState,
+  upsertSavedQuery,
+} from './lib/workspaceState';
+import {
+  createEmptyExplainSummary,
+  formatExplainMapping,
+  formatPlanMetrics,
+  getEstimateBadgeLabel,
+  getEstimateSeverity,
+  getStrongestExplainSignal,
+  parseExplainInput,
+} from './lib/explainAnalysis';
+import { SAMPLE_SCHEMA_SQL, getDialectSampleSql } from './lib/sqlSamples';
+import {
+  dialectLabel,
+  formatCompactNumber,
+  formatDialectEvidence,
+  formatEntityNoteLabel,
+  formatJoinTypeLabel,
+  formatPlural,
+  formatSignedDelta,
+  formatStatementTypeLabel,
+  getFlagContent,
+  layoutModeLabel,
+  normalizeSpaces,
+  reviewStatusLabel,
+  reviewStatusTone,
+  schemaSourceLabel,
+  severityLabel,
+  truncateText,
+} from './lib/presentation';
+import {
+  buildCompareSummary,
+  buildExecutionReport,
+  buildJoinComparisonLabel,
+  buildReviewReport,
+  buildRewriteGuidance,
+} from './lib/reviewArtifacts';
+import type {
+  AliasFilterContext,
+  ColumnLineage,
+  DerivedRelation,
+  DetailTab,
+  DiagnosticSummary,
+  DialectMode,
+  ExplainSignal,
+  FanoutImpact,
+  JoinCardinality,
+  JoinConditionPair,
+  JoinInsight,
+  JoinRef,
+  LayoutMode,
+  ReviewStatus,
+  SavedQuery,
+  SchemaTableMetadata,
+  SearchState,
+  SqlDiagnostic,
+  TableRef,
+} from './lib/types';
 
-const POSTGRES_SAMPLE_SQL = `SELECT
-  o.id,
-  o.created_at,
-  c.name AS customer_name,
-  SUM(oi.quantity * oi.unit_price) AS total_revenue,
-  COUNT(DISTINCT p.id) AS product_count
-FROM orders o
-INNER JOIN customers c ON c.id = o.customer_id
-LEFT JOIN order_items oi ON oi.order_id = o.id
-LEFT JOIN products p ON p.id = oi.product_id
-WHERE o.created_at >= DATE_TRUNC('month', CURRENT_DATE)
-  AND LOWER(c.country) = 'romania'
-GROUP BY o.id, o.created_at, c.name
-ORDER BY total_revenue DESC
-LIMIT 50;`;
-const SAMPLE_SQL_BY_DIALECT: Record<DialectMode, string> = {
-  postgres: POSTGRES_SAMPLE_SQL,
-  mysql: `SELECT
-  o.id,
-  o.created_at,
-  c.name AS customer_name,
-  SUM(oi.quantity * oi.unit_price) AS total_revenue
-FROM orders o
-INNER JOIN customers c ON c.id = o.customer_id
-LEFT JOIN order_items oi ON oi.order_id = o.id
-WHERE o.created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-  AND LOWER(c.country) = 'romania'
-GROUP BY o.id, o.created_at, c.name
-ORDER BY total_revenue DESC
-LIMIT 50 OFFSET 0;`,
-  mariadb: `SELECT
-  o.id,
-  c.name AS customer_name,
-  SUM(oi.quantity) AS total_qty
-FROM orders o
-STRAIGHT_JOIN customers c ON c.id = o.customer_id
-LEFT JOIN order_items oi ON oi.order_id = o.id
-WHERE o.created_at >= DATE_SUB(CURDATE(), INTERVAL 14 DAY)
-GROUP BY o.id, c.name
-ORDER BY total_qty DESC
-LIMIT 25;`,
-  sqlite: `SELECT
-  o.id,
-  strftime('%Y-%m-%d', o.created_at) AS order_day,
-  c.name AS customer_name,
-  COUNT(oi.id) AS item_count
-FROM orders o
-INNER JOIN customers c ON c.id = o.customer_id
-LEFT JOIN order_items oi ON oi.order_id = o.id
-WHERE date(o.created_at) >= date('now', '-30 day')
-GROUP BY o.id, order_day, c.name
-ORDER BY item_count DESC
-LIMIT 50;`,
-  bigquery: `SELECT
-  o.id,
-  item.product_id,
-  c.name AS customer_name
-FROM \`analytics.orders\` o
-INNER JOIN \`analytics.customers\` c ON c.id = o.customer_id
-LEFT JOIN UNNEST(o.items) AS item
-QUALIFY ROW_NUMBER() OVER (PARTITION BY o.id ORDER BY item.product_id) = 1;`,
-  sqlserver: `SELECT TOP (25)
-  o.id,
-  o.created_at,
-  c.name AS customer_name
-FROM [dbo].[Orders] o WITH (NOLOCK)
-INNER JOIN [dbo].[Customers] c ON c.id = o.customer_id
-LEFT JOIN [dbo].[OrderItems] oi ON oi.order_id = o.id
-WHERE o.created_at >= DATEADD(day, -30, CAST(GETDATE() AS date))
-ORDER BY o.created_at DESC
-OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY;`,
-  oracle: `SELECT
-  o.id,
-  o.created_at,
-  c.name AS customer_name
-FROM orders o
-INNER JOIN customers c ON c.id = o.customer_id
-LEFT JOIN order_items oi ON oi.order_id = o.id
-WHERE TRUNC(o.created_at) >= TRUNC(SYSDATE) - 30
-  AND ROWNUM <= 25
-ORDER BY o.created_at DESC;`,
-  snowflake: `SELECT
-  o.id,
-  c.name AS customer_name,
-  oi.order_id
-FROM orders o
-INNER JOIN customers c ON c.id = o.customer_id
-LEFT JOIN order_items oi ON oi.order_id = o.id
-QUALIFY ROW_NUMBER() OVER (PARTITION BY o.id ORDER BY o.created_at DESC) = 1;`,
-  duckdb: `SELECT
-  o.id,
-  c.name AS customer_name
-FROM read_parquet('orders.parquet') o
-LEFT JOIN customers c ON c.id = o.customer_id
-WHERE date_trunc('month', o.created_at) = date_trunc('month', current_date)
-LIMIT 25;`,
-  redshift: `SELECT
-  o.id,
-  c.name AS customer_name
-FROM orders o
-INNER JOIN customers c ON c.id = o.customer_id
-QUALIFY ROW_NUMBER() OVER (PARTITION BY o.id ORDER BY o.created_at DESC) = 1;`,
-  trino: `SELECT
-  o.id,
-  item.item_id
-FROM hive.sales.orders o
-CROSS JOIN UNNEST(o.item_ids) AS item(item_id)
-FETCH FIRST 25 ROWS ONLY;`,
-};
-const SAMPLE_SCHEMA_SQL = `CREATE TABLE customers (
-  id BIGINT PRIMARY KEY,
-  name TEXT,
-  country TEXT
-);
-
-CREATE TABLE orders (
-  id BIGINT PRIMARY KEY,
-  customer_id BIGINT NOT NULL REFERENCES customers(id),
-  created_at TIMESTAMP
-);
-
-CREATE INDEX idx_orders_customer_id ON orders(customer_id);
-
-CREATE TABLE order_items (
-  id BIGINT PRIMARY KEY,
-  order_id BIGINT NOT NULL REFERENCES orders(id),
-  product_id BIGINT,
-  quantity INTEGER,
-  unit_price NUMERIC
-);
-
-CREATE INDEX idx_order_items_order_id ON order_items(order_id);
-`;
-
-const NODE_WIDTH = 188;
-const NODE_HEIGHT = 92;
 const SQL_EDITOR_LINE_HEIGHT = 24;
 const SQL_EDITOR_PADDING = 14;
 
-interface GraphLayout {
-  width: number;
-  height: number;
-  positions: Record<string, { x: number; y: number }>;
-}
-
-type LayoutMode = 'horizontal' | 'vertical' | 'radial';
-type NodeSide = 'left' | 'right' | 'top' | 'bottom';
-type DialectMode = SqlDialect;
-
-interface EdgePort {
-  startX: number;
-  startY: number;
-  endX: number;
-  endY: number;
-  controlOneX: number;
-  controlOneY: number;
-  controlTwoX: number;
-  controlTwoY: number;
-  labelX: number;
-  labelY: number;
-}
-
-type JoinCardinality = 'N:1' | '1:N' | 'M:N';
-
-interface JoinInsight {
-  cardinality: JoinCardinality;
-  tone: 'good' | 'caution' | 'review';
-  badgeLabel: JoinCardinality;
-  badgeHint: string;
-  confidence: 'heuristic' | 'verified';
-  confidenceLabel: 'Heuristic' | 'Verified';
-  labelWidth: number;
-  joinLabel: string;
-  compactCondition: string;
-  fullConditionLabel: string;
-  summary: string;
-  pairs: JoinConditionPair[];
-  indexHints: string[];
-  fanoutSeverity: 'none' | 'caution' | 'high';
-  fanoutSummary: string;
-}
-
-interface SavedQuery {
-  id: string;
-  title: string;
-  sql: string;
-  updatedAt: number;
-  selectedStatementIndex: number;
-  dialect: DialectMode;
-}
-
-interface WorkspaceViewState {
-  layoutMode: LayoutMode;
-  dialect: DialectMode;
-  schemaSql: string;
-  expandedDerivedIds: string[];
-  nodeOffsets: Record<string, { x: number; y: number }>;
-  pan: { x: number; y: number };
-  zoom: number;
-  entityNotes: Record<string, string>;
-  compareSql: string;
-  compareExplainInput: string;
-  updatedAt: number;
-}
-
-interface DiagnosticSummary {
-  blocking: SqlDiagnostic | null;
-  items: SqlDiagnostic[];
-}
-
-interface JoinConditionPair {
-  sourceAlias: string;
-  sourceColumn: string;
-  targetAlias: string;
-  targetColumn: string;
-}
-
-interface AliasFilterContext {
-  plainColumns: string[];
-  wrappedColumns: string[];
-  expressions: string[];
-}
-
-interface SearchState {
-  active: boolean;
-  query: string;
-  matchCount: number;
-  matchedAliases: Set<string>;
-  matchedJoinIds: Set<string>;
-}
-
-interface ExplainSignal {
-  id: string;
-  severity: 'high' | 'medium' | 'low';
-  title: string;
-  detail: string;
-  relationName?: string;
-  relationAliases?: string[];
-  joinIds?: string[];
-  costStart?: number;
-  costEnd?: number;
-  rowsEstimate?: number;
-  actualRows?: number;
-  loops?: number;
-  actualTimeEnd?: number;
-  estimateFactor?: number;
-}
-
-interface ExplainSummary {
-  items: ExplainSignal[];
-  relationSignals: Record<string, ExplainSignal[]>;
-  joinSignals: Record<string, ExplainSignal[]>;
-  summary: {
-    seqScans: number;
-    indexedReads: number;
-    joinNodes: number;
-    sorts: number;
-    mappedJoins: number;
-    maxCost: number;
-    maxRows: number;
-    estimateWarnings: number;
-  };
-}
-
-interface CompareSummary {
-  tableDelta: number;
-  joinDelta: number;
-  flagDelta: number;
-  complexityDelta: number;
-  planSignalDelta: number;
-  seqScanDelta: number;
-  joinNodeDelta: number;
-  maxCostDelta: number | null;
-  maxRowsDelta: number | null;
-  addedTables: string[];
-  removedTables: string[];
-  addedJoins: string[];
-  removedJoins: string[];
-  addedFlags: string[];
-  removedFlags: string[];
-  hasPlanComparison: boolean;
-}
-
-interface ColumnLineage {
-  id: string;
-  label: string;
-  expression: string;
-  alias?: string;
-  references: Array<{ alias: string; column: string }>;
-  relatedAliases: string[];
-  relatedJoinIds: string[];
-  functionNames: string[];
-  hasAggregation: boolean;
-}
-
-interface FanoutImpact {
-  severity: 'caution' | 'high';
-  viaJoinId: string;
-  reason: string;
-}
-
-type DetailTab = 'joins' | 'clauses' | 'lineage';
-
-const severityLabel: Record<Severity, string> = {
-  high: 'High',
-  medium: 'Medium',
-  low: 'Low',
-};
-const layoutModeLabel: Record<LayoutMode, string> = {
-  horizontal: 'Horizontal',
-  vertical: 'Vertical',
-  radial: 'Radial',
-};
-const DIALECT_OPTIONS = SUPPORTED_SQL_DIALECTS as readonly DialectMode[];
-const isSupportedDialect = (value: unknown): value is DialectMode =>
-  typeof value === 'string' && DIALECT_OPTIONS.includes(value as DialectMode);
-const dialectLabel: Record<DialectMode, string> = {
-  postgres: 'Postgres',
-  mysql: 'MySQL',
-  mariadb: 'MariaDB',
-  sqlite: 'SQLite',
-  bigquery: 'BigQuery',
-  sqlserver: 'SQL Server',
-  oracle: 'Oracle',
-  snowflake: 'Snowflake',
-  duckdb: 'DuckDB',
-  redshift: 'Redshift',
-  trino: 'Trino',
-};
-
 const EDGE_CONDITION_MAX = 30;
-const SAVED_QUERIES_KEY = 'queryviz.savedQueries.v1';
-const WORKSPACE_VIEW_STATE_KEY = 'queryviz.workspaceState.v1';
-const MAX_SAVED_QUERIES = 10;
-const MAX_WORKSPACE_VIEW_STATES = 18;
-const FLAG_COPY: Record<string, { title: string; description: string }> = {
-  'join-heavy query': {
-    title: 'Join-heavy query',
-    description: 'Run EXPLAIN ANALYZE. Look for Seq Scans on join nodes. If indexes exist, this may be fine.',
-  },
-  'function inside where': {
-    title: 'Function in WHERE',
-    description: 'DATE_TRUNC / LOWER in WHERE prevents index use. Extract to a computed column or rewrite the condition.',
-  },
-  'subquery detected': {
-    title: 'Correlated subquery',
-    description: 'Executes once per row. Consider rewriting as a LEFT JOIN with aggregation.',
-  },
-  'wildcard select': {
-    title: 'Wildcard SELECT',
-    description: 'Replace SELECT * with explicit column list to reduce I/O and avoid schema drift.',
-  },
-  'straight_join hint': {
-    title: 'STRAIGHT_JOIN hint',
-    description: 'STRAIGHT_JOIN forces join order. Verify the plan still improves after checking fanout and index usage.',
-  },
-  'nolock hint': {
-    title: 'NOLOCK hint',
-    description: 'NOLOCK can return dirty or duplicated rows. Keep it only if stale or inconsistent reads are acceptable.',
-  },
-  'rownum filter': {
-    title: 'ROWNUM filter',
-    description: 'ROWNUM is applied before the final ORDER BY in Oracle plans. Confirm the row cap matches what users expect.',
-  },
-  'qualify filter': {
-    title: 'QUALIFY filter',
-    description: 'QUALIFY usually implies a window sort. Inspect partition size and sort cost in the plan before calling it cheap.',
-  },
-  'repeated unnest': {
-    title: 'Repeated UNNEST',
-    description: 'Multiple UNNEST operations can explode row counts. Validate fanout and aggregate correctness downstream.',
-  },
-  'flatten relation': {
-    title: 'FLATTEN relation',
-    description: 'FLATTEN can multiply rows very quickly. Filter nested arrays early and verify row counts before aggregating.',
-  },
-  'external file scan': {
-    title: 'External file scan',
-    description: 'File-backed scans are great for exploration, but push filters down early so you do not read more data than needed.',
-  },
-  'write statement': {
-    title: 'Write statement',
-    description: 'This statement writes data. Validate the source-side plan and predicates before running it against production tables.',
-  },
-  'apply operator': {
-    title: 'APPLY operator',
-    description: 'APPLY can behave like a row-by-row nested loop. Check SHOWPLAN for repeated scans before keeping it.',
-  },
-  'top without order by': {
-    title: 'TOP without ORDER BY',
-    description: 'TOP without ORDER BY is nondeterministic. Add an order if callers expect stable or reproducible rows.',
-  },
-  'connect by recursion': {
-    title: 'CONNECT BY recursion',
-    description: 'CONNECT BY hierarchies can fan out fast. Inspect row growth and sort cost before assuming the tree is cheap.',
-  },
-  'wildcard table scan': {
-    title: 'Wildcard table scan',
-    description: 'Wildcard tables can read many shards at once. Prune with _TABLE_SUFFIX or a tighter source pattern first.',
-  },
-  'windowed qualify': {
-    title: 'Windowed QUALIFY',
-    description: 'QUALIFY with ORDER BY usually introduces a window sort. Inspect partition width, repartitioning, and bytes scanned.',
-  },
-  'unfiltered warehouse join': {
-    title: 'Unfiltered warehouse join',
-    description: 'Warehouse joins without selective filters can trigger distribution-heavy scans. Check DS_BCAST or repartition steps in the plan.',
-  },
-  'cross join unnest': {
-    title: 'CROSS JOIN UNNEST',
-    description: 'CROSS JOIN UNNEST can expand rows aggressively. Validate fanout and downstream aggregate correctness.',
-  },
-};
 
 const createDotFileName = (statementIndex: number) => `queryviz-statement-${statementIndex + 1}.dot`;
 const createPngFileName = (statementIndex: number) => `queryviz-statement-${statementIndex + 1}.png`;
@@ -456,15 +114,6 @@ const summarizeStatement = (statement: string, index: number) => {
   const normalized = statement.replace(/\s+/g, ' ').trim();
   return `#${index + 1} ${normalized.slice(0, 78)}${normalized.length > 78 ? '...' : ''}`;
 };
-
-const getDialectSampleSql = (dialect: DialectMode) => SAMPLE_SQL_BY_DIALECT[dialect] ?? POSTGRES_SAMPLE_SQL;
-const formatDialectEvidence = (detection: SqlDialectDetection) =>
-  detection.evidence.length > 0 ? detection.evidence.join(' · ') : 'No strong dialect markers yet';
-const formatStatementTypeLabel = (statementType: string) =>
-  statementType
-    .split('-')
-    .map((part) => part.toUpperCase())
-    .join(' ');
 const getSpecialNodeLabel = (table: TableRef) => {
   if (!table.specialType) {
     return null;
@@ -483,773 +132,7 @@ const getSpecialNodeLabel = (table: TableRef) => {
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
-const buildDepthMap = (tables: TableRef[], joins: JoinRef[]) => {
-  const depthMap = new Map<string, number>();
-  const source = tables[0];
-
-  if (source) {
-    depthMap.set(source.alias, 0);
-  }
-
-  for (let iteration = 0; iteration < tables.length + joins.length; iteration += 1) {
-    let changed = false;
-
-    joins.forEach((join) => {
-      const sourceDepth = depthMap.get(join.sourceAlias);
-      const targetDepth = depthMap.get(join.targetAlias);
-      const nextDepth = (sourceDepth ?? 0) + 1;
-
-      if (targetDepth === undefined || nextDepth > targetDepth) {
-        depthMap.set(join.targetAlias, nextDepth);
-        changed = true;
-      }
-    });
-
-    if (!changed) {
-      break;
-    }
-  }
-
-  tables.forEach((table, index) => {
-    if (!depthMap.has(table.alias)) {
-      depthMap.set(table.alias, index === 0 ? 0 : 1);
-    }
-  });
-
-  return depthMap;
-};
-
-const createHorizontalLayout = (tables: TableRef[], joins: JoinRef[]): GraphLayout => {
-  const depthMap = buildDepthMap(tables, joins);
-  const columns = new Map<number, TableRef[]>();
-
-  tables.forEach((table) => {
-    const depth = depthMap.get(table.alias) ?? 0;
-    const bucket = columns.get(depth) ?? [];
-    bucket.push(table);
-    columns.set(depth, bucket);
-  });
-
-  const sortedDepths = Array.from(columns.keys()).sort((left, right) => left - right);
-  const maxColumnSize = Math.max(...Array.from(columns.values()).map((bucket) => bucket.length), 1);
-  const joinCount = Math.max(0, tables.length - 1);
-  const columnGap = joinCount <= 4 ? 320 : joinCount <= 9 ? 360 : 410;
-  const rowGap = maxColumnSize <= 3 ? 170 : maxColumnSize <= 6 ? 195 : 225;
-  const leftPadding = 110;
-  const topPadding = 100;
-  const width = Math.max(1500, leftPadding + sortedDepths.length * columnGap + NODE_WIDTH + 200);
-  const height = Math.max(960, topPadding * 2 + (maxColumnSize - 1) * rowGap + NODE_HEIGHT);
-  const positions: Record<string, { x: number; y: number }> = {};
-
-  sortedDepths.forEach((depth, columnIndex) => {
-    const bucket = columns.get(depth) ?? [];
-    const bucketHeight = NODE_HEIGHT + rowGap * Math.max(bucket.length - 1, 0);
-    const startY = Math.max(topPadding, (height - bucketHeight) / 2);
-
-    bucket.forEach((table, rowIndex) => {
-      positions[table.alias] = {
-        x: leftPadding + columnIndex * columnGap,
-        y: startY + rowIndex * rowGap,
-      };
-    });
-  });
-
-  return { width, height, positions };
-};
-
-const createVerticalLayout = (tables: TableRef[], joins: JoinRef[]): GraphLayout => {
-  const depthMap = buildDepthMap(tables, joins);
-  const rows = new Map<number, TableRef[]>();
-
-  tables.forEach((table) => {
-    const depth = depthMap.get(table.alias) ?? 0;
-    const bucket = rows.get(depth) ?? [];
-    bucket.push(table);
-    rows.set(depth, bucket);
-  });
-
-  const sortedDepths = Array.from(rows.keys()).sort((left, right) => left - right);
-  const maxRowSize = Math.max(...Array.from(rows.values()).map((bucket) => bucket.length), 1);
-  const joinCount = Math.max(0, tables.length - 1);
-  const columnGap = maxRowSize <= 3 ? 260 : maxRowSize <= 6 ? 228 : 204;
-  const rowGap = joinCount <= 4 ? 210 : joinCount <= 9 ? 235 : 260;
-  const leftPadding = 120;
-  const topPadding = 100;
-  const width = Math.max(1500, leftPadding * 2 + NODE_WIDTH + Math.max(0, maxRowSize - 1) * columnGap);
-  const height = Math.max(960, topPadding * 2 + NODE_HEIGHT + Math.max(0, sortedDepths.length - 1) * rowGap);
-  const positions: Record<string, { x: number; y: number }> = {};
-
-  sortedDepths.forEach((depth, rowIndex) => {
-    const bucket = rows.get(depth) ?? [];
-    const bucketWidth = NODE_WIDTH + columnGap * Math.max(bucket.length - 1, 0);
-    const startX = Math.max(leftPadding, (width - bucketWidth) / 2);
-
-    bucket.forEach((table, columnIndex) => {
-      positions[table.alias] = {
-        x: startX + columnIndex * columnGap,
-        y: topPadding + rowIndex * rowGap,
-      };
-    });
-  });
-
-  return { width, height, positions };
-};
-
-const createRadialLayout = (tables: TableRef[], joins: JoinRef[]): GraphLayout => {
-  const depthMap = buildDepthMap(tables, joins);
-  const rings = new Map<number, TableRef[]>();
-
-  tables.forEach((table) => {
-    const depth = depthMap.get(table.alias) ?? 0;
-    const bucket = rings.get(depth) ?? [];
-    bucket.push(table);
-    rings.set(depth, bucket);
-  });
-
-  const sortedDepths = Array.from(rings.keys()).sort((left, right) => left - right);
-  const maxDepth = Math.max(...sortedDepths, 0);
-  const ringGap = maxDepth <= 1 ? 220 : maxDepth <= 3 ? 196 : 172;
-  const padding = 240;
-  const width = Math.max(1480, padding * 2 + NODE_WIDTH + maxDepth * ringGap * 2);
-  const height = Math.max(1120, padding * 2 + NODE_HEIGHT + maxDepth * ringGap * 2);
-  const centerX = width / 2;
-  const centerY = height / 2;
-  const positions: Record<string, { x: number; y: number }> = {};
-
-  sortedDepths.forEach((depth) => {
-    const bucket = rings.get(depth) ?? [];
-
-    if (depth === 0) {
-      bucket.forEach((table) => {
-        positions[table.alias] = {
-          x: centerX - NODE_WIDTH / 2,
-          y: centerY - NODE_HEIGHT / 2,
-        };
-      });
-      return;
-    }
-
-    const radius = depth * ringGap;
-    const step = bucket.length <= 1 ? 0 : (Math.PI * 2) / bucket.length;
-    const startAngle = bucket.length <= 1 ? -Math.PI / 2 : -Math.PI / 2 + (depth % 2 === 0 ? 0 : step / 2);
-
-    bucket.forEach((table, index) => {
-      const angle = startAngle + step * index;
-
-      positions[table.alias] = {
-        x: centerX + Math.cos(angle) * radius - NODE_WIDTH / 2,
-        y: centerY + Math.sin(angle) * radius - NODE_HEIGHT / 2,
-      };
-    });
-  });
-
-  return { width, height, positions };
-};
-
-const createNodeLayout = (tables: TableRef[], joins: JoinRef[], layoutMode: LayoutMode): GraphLayout => {
-  if (layoutMode === 'vertical') {
-    return createVerticalLayout(tables, joins);
-  }
-
-  if (layoutMode === 'radial') {
-    return createRadialLayout(tables, joins);
-  }
-
-  return createHorizontalLayout(tables, joins);
-};
-
-const getPreferredSide = (source: { x: number; y: number }, target: { x: number; y: number }): NodeSide => {
-  const dx = target.x + NODE_WIDTH / 2 - (source.x + NODE_WIDTH / 2);
-  const dy = target.y + NODE_HEIGHT / 2 - (source.y + NODE_HEIGHT / 2);
-
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    return dx >= 0 ? 'right' : 'left';
-  }
-
-  return dy >= 0 ? 'bottom' : 'top';
-};
-
-const getSideVector = (side: NodeSide) => {
-  if (side === 'left') {
-    return { x: -1, y: 0 };
-  }
-
-  if (side === 'right') {
-    return { x: 1, y: 0 };
-  }
-
-  if (side === 'top') {
-    return { x: 0, y: -1 };
-  }
-
-  return { x: 0, y: 1 };
-};
-
-const getAnchorPoint = (
-  position: { x: number; y: number },
-  side: NodeSide,
-  index: number,
-  count: number,
-) => {
-  if (side === 'left' || side === 'right') {
-    const step = NODE_HEIGHT / (count + 1);
-
-    return {
-      x: side === 'right' ? position.x + NODE_WIDTH : position.x,
-      y: position.y + step * (index + 1),
-    };
-  }
-
-  const step = NODE_WIDTH / (count + 1);
-
-  return {
-    x: position.x + step * (index + 1),
-    y: side === 'bottom' ? position.y + NODE_HEIGHT : position.y,
-  };
-};
-
-const getBezierMidpoint = (
-  start: { x: number; y: number },
-  controlOne: { x: number; y: number },
-  controlTwo: { x: number; y: number },
-  end: { x: number; y: number },
-) => {
-  const t = 0.5;
-  const inverse = 1 - t;
-
-  return {
-    x:
-      inverse ** 3 * start.x +
-      3 * inverse ** 2 * t * controlOne.x +
-      3 * inverse * t ** 2 * controlTwo.x +
-      t ** 3 * end.x,
-    y:
-      inverse ** 3 * start.y +
-      3 * inverse ** 2 * t * controlOne.y +
-      3 * inverse * t ** 2 * controlTwo.y +
-      t ** 3 * end.y,
-  };
-};
-
-const createEdgePortMap = (
-  joins: JoinRef[],
-  positions: Record<string, { x: number; y: number }>,
-  nodeOffsets: Record<string, { x: number; y: number }>,
-) => {
-  const sides = new Map<string, { sourceSide: NodeSide; targetSide: NodeSide }>();
-  const sourceBuckets = new Map<string, JoinRef[]>();
-  const targetBuckets = new Map<string, JoinRef[]>();
-
-  joins.forEach((join) => {
-    const sourceBase = positions[join.sourceAlias] ?? { x: 0, y: 0 };
-    const targetBase = positions[join.targetAlias] ?? { x: 0, y: 0 };
-    const sourceOffset = nodeOffsets[join.sourceAlias] ?? { x: 0, y: 0 };
-    const targetOffset = nodeOffsets[join.targetAlias] ?? { x: 0, y: 0 };
-    const source = { x: sourceBase.x + sourceOffset.x, y: sourceBase.y + sourceOffset.y };
-    const target = { x: targetBase.x + targetOffset.x, y: targetBase.y + targetOffset.y };
-    const sourceSide = getPreferredSide(source, target);
-    const targetSide = getPreferredSide(target, source);
-
-    sides.set(join.id, { sourceSide, targetSide });
-
-    const sourceKey = `${join.sourceAlias}:${sourceSide}`;
-    const targetKey = `${join.targetAlias}:${targetSide}`;
-    sourceBuckets.set(sourceKey, [...(sourceBuckets.get(sourceKey) ?? []), join]);
-    targetBuckets.set(targetKey, [...(targetBuckets.get(targetKey) ?? []), join]);
-  });
-
-  const sortBucket = (
-    bucket: JoinRef[],
-    getSide: (join: JoinRef) => NodeSide,
-    getCounterpart: (join: JoinRef) => { x: number; y: number },
-  ) => {
-    bucket.sort((left, right) => {
-      const side = getSide(left);
-      const leftPoint = getCounterpart(left);
-      const rightPoint = getCounterpart(right);
-
-      return side === 'left' || side === 'right'
-        ? leftPoint.y - rightPoint.y
-        : leftPoint.x - rightPoint.x;
-    });
-  };
-
-  sourceBuckets.forEach((bucket) => {
-    sortBucket(
-      bucket,
-      (join) => sides.get(join.id)?.sourceSide ?? 'right',
-      (join) => {
-        const base = positions[join.targetAlias] ?? { x: 0, y: 0 };
-        const offset = nodeOffsets[join.targetAlias] ?? { x: 0, y: 0 };
-        return { x: base.x + offset.x, y: base.y + offset.y };
-      },
-    );
-  });
-
-  targetBuckets.forEach((bucket) => {
-    sortBucket(
-      bucket,
-      (join) => sides.get(join.id)?.targetSide ?? 'left',
-      (join) => {
-        const base = positions[join.sourceAlias] ?? { x: 0, y: 0 };
-        const offset = nodeOffsets[join.sourceAlias] ?? { x: 0, y: 0 };
-        return { x: base.x + offset.x, y: base.y + offset.y };
-      },
-    );
-  });
-
-  const portMap = new Map<string, EdgePort>();
-
-  joins.forEach((join) => {
-    const sourceBase = positions[join.sourceAlias] ?? { x: 0, y: 0 };
-    const targetBase = positions[join.targetAlias] ?? { x: 0, y: 0 };
-    const sourceOffset = nodeOffsets[join.sourceAlias] ?? { x: 0, y: 0 };
-    const targetOffset = nodeOffsets[join.targetAlias] ?? { x: 0, y: 0 };
-    const source = { x: sourceBase.x + sourceOffset.x, y: sourceBase.y + sourceOffset.y };
-    const target = { x: targetBase.x + targetOffset.x, y: targetBase.y + targetOffset.y };
-    const currentSides = sides.get(join.id) ?? { sourceSide: 'right', targetSide: 'left' };
-    const sourceKey = `${join.sourceAlias}:${currentSides.sourceSide}`;
-    const targetKey = `${join.targetAlias}:${currentSides.targetSide}`;
-    const outgoingEdges = sourceBuckets.get(sourceKey) ?? [join];
-    const incomingEdges = targetBuckets.get(targetKey) ?? [join];
-    const outgoingIndex = Math.max(0, outgoingEdges.findIndex((item) => item.id === join.id));
-    const incomingIndex = Math.max(0, incomingEdges.findIndex((item) => item.id === join.id));
-    const start = getAnchorPoint(source, currentSides.sourceSide, outgoingIndex, outgoingEdges.length);
-    const end = getAnchorPoint(target, currentSides.targetSide, incomingIndex, incomingEdges.length);
-    const distance = Math.hypot(end.x - start.x, end.y - start.y);
-    const span = clamp(distance * 0.34, 84, 220);
-    const sourceVector = getSideVector(currentSides.sourceSide);
-    const targetVector = getSideVector(currentSides.targetSide);
-    const controlOne = {
-      x: start.x + sourceVector.x * span,
-      y: start.y + sourceVector.y * span,
-    };
-    const controlTwo = {
-      x: end.x + targetVector.x * span,
-      y: end.y + targetVector.y * span,
-    };
-    const labelPoint = getBezierMidpoint(start, controlOne, controlTwo, end);
-
-    portMap.set(join.id, {
-      startX: start.x,
-      startY: start.y,
-      endX: end.x,
-      endY: end.y,
-      controlOneX: controlOne.x,
-      controlOneY: controlOne.y,
-      controlTwoX: controlTwo.x,
-      controlTwoY: controlTwo.y,
-      labelX: labelPoint.x,
-      labelY: labelPoint.y - 10,
-    });
-  });
-
-  return portMap;
-};
-
-const normalizeSpaces = (value: string) => value.replace(/\s+/g, ' ').trim();
-
-const truncateText = (value: string, maxLength: number) => {
-  if (value.length <= maxLength) {
-    return value;
-  }
-
-  return `${value.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-};
-
-const formatPlural = (count: number, singular: string, plural = `${singular}s`) =>
-  `${count} ${count === 1 ? singular : plural}`;
-
-const formatCompactNumber = (value: number) => {
-  if (!Number.isFinite(value)) {
-    return '0';
-  }
-
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`;
-  }
-
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
-  }
-
-  return value >= 100 ? Math.round(value).toString() : value.toFixed(value >= 10 ? 1 : 2).replace(/\.0+$/, '');
-};
-
-const formatPlanMetrics = (signal: ExplainSignal, variant: 'compact' | 'full' = 'compact') => {
-  const parts: string[] = [];
-
-  if (signal.costEnd !== undefined) {
-    if (signal.costStart !== undefined) {
-      parts.push(`cost ${formatCompactNumber(signal.costStart)}..${formatCompactNumber(signal.costEnd)}`);
-    } else {
-      parts.push(`cost ${formatCompactNumber(signal.costEnd)}`);
-    }
-  }
-
-  if (signal.rowsEstimate !== undefined) {
-    parts.push(`${signal.actualRows !== undefined && variant === 'full' ? 'est' : 'rows'} ${formatCompactNumber(signal.rowsEstimate)}`);
-  }
-
-  if (signal.actualRows !== undefined) {
-    parts.push(`actual ${formatCompactNumber(signal.actualRows)}`);
-  }
-
-  const estimateLabel = getEstimateBadgeLabel(signal.estimateFactor);
-  if (estimateLabel) {
-    parts.push(variant === 'full' ? estimateLabel.replace(/^Est /, 'estimate ') : estimateLabel);
-  }
-
-  if (signal.loops !== undefined && variant === 'full') {
-    parts.push(`loops ${formatCompactNumber(signal.loops)}`);
-  }
-
-  return parts.join(' · ');
-};
-
-const escapeMarkdownCell = (value: string) => value.replace(/\|/g, '\\|').replace(/\n/g, '<br />');
-
-const formatJoinTypeLabel = (joinType: string) => {
-  const normalized = normalizeSpaces(joinType);
-  if (!normalized) {
-    return 'JOIN';
-  }
-
-  if (/^(merge|update target)$/i.test(normalized)) {
-    return normalized.toUpperCase();
-  }
-
-  return /join$/i.test(normalized) ? normalized.toUpperCase() : `${normalized.toUpperCase()} JOIN`;
-};
-
 const cleanColumnName = (value: string) => value.replace(/[`"'[\]]/g, '').trim();
-
-const cleanExplainRelationName = (value: string) => {
-  const bracketParts = Array.from(value.matchAll(/\[([^\]]+)\]/g)).map((match) => match[1]);
-  if (bracketParts.length > 0) {
-    const objectParts =
-      bracketParts.length >= 4 && /^(?:PK|IX|AK|UQ|FK|IDX)[_A-Z0-9-]*/i.test(bracketParts[bracketParts.length - 1])
-        ? bracketParts.slice(0, -1)
-        : bracketParts;
-    return cleanColumnName(objectParts.join('.').replace(/:/g, '.'));
-  }
-
-  return cleanColumnName(
-    value
-      .replace(/^table\s*=\s*/i, '')
-      .replace(/^object:\(/i, '')
-      .replace(/[)\]]+$/g, '')
-      .replace(/:/g, '.'),
-  );
-};
-
-const extractExplainRelationName = (line: string) => {
-  const patterns = [
-    /\b(?:XN|DS_[A-Z_]+)?\s*Seq Scan on ([a-zA-Z0-9_."`[\]#@]+)/i,
-    /\b(?:XN|DS_[A-Z_]+)?\s*Seq Scan\s+([a-zA-Z0-9_."`[\]#@]+)/i,
-    /\b(?:Index Scan|Index Only Scan|Bitmap Heap Scan|Bitmap Index Scan) (?:using [^\s]+ )?on ([a-zA-Z0-9_."`[\]#@]+)/i,
-    /\b(?:Table Scan|Index Seek|Index Scan|Clustered Index Scan|Clustered Index Seek|Columnstore Index Scan|Columnstore Index Seek|Remote Scan|Key Lookup|RID Lookup)\(OBJECT:\(([^)]+)\)\)/i,
-    /\bTABLE ACCESS (?:FULL|BY INDEX ROWID|STORAGE FULL)\s+([A-Z0-9_.$#@"`]+)/i,
-    /\bTableScan\[(?:[^\]]*?table\s*=\s*)?([^\]]+)\]/i,
-    /\bScanFilterProject\[(?:[^\]]*?table\s*=\s*)?([^\]]+)\]/i,
-    /\b(?:JoinBuild|JoinProbe)\[(?:[^\]]*?table\s*=\s*)?([^\]]+)\]/i,
-    /\bREAD\s+(?:FROM\s+)?([a-zA-Z0-9_."`[\]#@:-]+)/i,
-    /\b(?:S3|TABLE|FILE)\s+SCAN\s+(?:ON\s+)?([a-zA-Z0-9_."`[\]#@:/-]+)/i,
-    /\b(?:FROM|TABLE):\s*([a-zA-Z0-9_."`[\]#@:-]+)/i,
-    /\bExternal Scan on ([a-zA-Z0-9_."`[\]#@]+)/i,
-  ] as const;
-
-  for (const pattern of patterns) {
-    const match = line.match(pattern);
-    if (match?.[1]) {
-      return cleanExplainRelationName(match[1]);
-    }
-  }
-
-  return null;
-};
-
-const getEstimateFactor = (rowsEstimate?: number, actualRows?: number) => {
-  if (
-    rowsEstimate === undefined ||
-    actualRows === undefined ||
-    !Number.isFinite(rowsEstimate) ||
-    !Number.isFinite(actualRows) ||
-    rowsEstimate <= 0 ||
-    actualRows < 0
-  ) {
-    return undefined;
-  }
-
-  if (actualRows === 0) {
-    return 0;
-  }
-
-  return actualRows / rowsEstimate;
-};
-
-const getEstimateSeverity = (factor?: number) => {
-  if (factor === undefined) {
-    return null;
-  }
-
-  if (factor >= 10 || factor <= 0.1) {
-    return 'high';
-  }
-
-  if (factor >= 4 || factor <= 0.25) {
-    return 'medium';
-  }
-
-  return 'low';
-};
-
-const formatEstimateDelta = (factor?: number) => {
-  if (factor === undefined || !Number.isFinite(factor) || factor <= 0) {
-    return '';
-  }
-
-  return factor >= 1
-    ? `${factor.toFixed(factor >= 10 ? 0 : 1)}x high`
-    : `${(1 / factor).toFixed(1)}x low`;
-};
-
-const getEstimateBadgeLabel = (factor?: number) => {
-  const severity = getEstimateSeverity(factor);
-  if (!severity || severity === 'low') {
-    return null;
-  }
-
-  return `Est ${formatEstimateDelta(factor)}`;
-};
-
-const getExplainNodeLabel = (node: Record<string, unknown>) => {
-  const candidates = [
-    node['Node Type'],
-    node.NodeType,
-    node.operation,
-    node.Operation,
-    node.name,
-    node.Name,
-    node.displayName,
-    node.kind,
-    node.stepType,
-    node['@type'],
-    node['@name'],
-  ];
-
-  const label = candidates.find((value) => typeof value === 'string' && value.trim().length > 0);
-  return typeof label === 'string' ? label.trim() : '';
-};
-
-const getExplainRelationNameFromNode = (node: Record<string, unknown>) => {
-  const extractNestedRelation = (value: unknown): string => {
-    if (typeof value === 'string') {
-      return extractExplainRelationName(value) ?? '';
-    }
-
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        const candidate = extractNestedRelation(item);
-        if (candidate) {
-          return candidate;
-        }
-      }
-      return '';
-    }
-
-    if (isRecord(value)) {
-      for (const nestedValue of Object.values(value)) {
-        const candidate = extractNestedRelation(nestedValue);
-        if (candidate) {
-          return candidate;
-        }
-      }
-    }
-
-    return '';
-  };
-
-  const directCandidates = [
-    node['Relation Name'],
-    node.RelationName,
-    node.relationName,
-    node.table,
-    node.tableName,
-    node.object,
-    node.objectName,
-    node.scanTarget,
-    node.alias,
-    node.Alias,
-    node.source,
-  ];
-
-  const direct = directCandidates.find((value) => typeof value === 'string' && value.trim().length > 0);
-  if (typeof direct === 'string') {
-    return cleanExplainRelationName(direct);
-  }
-
-  const listCandidates = [node.tables, node.relations, node.objects];
-  for (const candidate of listCandidates) {
-    if (!Array.isArray(candidate)) {
-      continue;
-    }
-
-    const firstString = candidate.find((value) => typeof value === 'string' && value.trim().length > 0);
-    if (typeof firstString === 'string') {
-      return cleanExplainRelationName(firstString);
-    }
-  }
-
-  const nestedStatistics = isRecord(node.statistics) ? node.statistics : null;
-  const nestedTable = nestedStatistics?.tableName;
-  if (typeof nestedTable === 'string' && nestedTable.trim()) {
-    return cleanExplainRelationName(nestedTable);
-  }
-
-  const nestedRelation = extractNestedRelation(node.steps) || extractNestedRelation(node.substeps) || extractNestedRelation(node.statistics);
-  if (nestedRelation) {
-    return nestedRelation;
-  }
-
-  const stringValues = Object.values(node).filter((value): value is string => typeof value === 'string');
-  for (const candidate of stringValues) {
-    const extracted = extractExplainRelationName(candidate);
-    if (extracted) {
-      return extracted;
-    }
-  }
-
-  return '';
-};
-
-const getExplainNumericValue = (node: Record<string, unknown>, keys: string[]) => {
-  for (const key of keys) {
-    const rawValue = node[key];
-    const numericValue =
-      typeof rawValue === 'number'
-        ? rawValue
-        : typeof rawValue === 'string'
-          ? Number(rawValue.replace(/,/g, '').trim())
-          : Number.NaN;
-
-    if (Number.isFinite(numericValue)) {
-      return numericValue;
-    }
-  }
-
-  return undefined;
-};
-
-const getExplainNodeChildren = (node: Record<string, unknown>) => {
-  const childKeys = [
-    'Plans',
-    'plans',
-    'children',
-    'Children',
-    'inputStages',
-    'subStages',
-    'sources',
-    'inputs',
-    'Nodes',
-    'nodes',
-    'operations',
-    'Operations',
-    'queryPlan',
-    'stages',
-    'Stage List',
-  ];
-
-  const children: Record<string, unknown>[] = [];
-  childKeys.forEach((key) => {
-    const value = node[key];
-    if (!Array.isArray(value)) {
-      return;
-    }
-
-    value.forEach((candidate) => {
-      if (isRecord(candidate)) {
-        children.push(candidate);
-      }
-    });
-  });
-
-  return children;
-};
-
-const extractExplainPlanRoots = (parsed: unknown): Record<string, unknown>[] => {
-  if (!isRecord(parsed) && !Array.isArray(parsed)) {
-    return [];
-  }
-
-  if (Array.isArray(parsed)) {
-    return parsed.flatMap((item) => extractExplainPlanRoots(item));
-  }
-
-  if (isRecord(parsed.Plan)) {
-    return [parsed.Plan];
-  }
-
-  if (Array.isArray(parsed.queryPlan)) {
-    const roots = parsed.queryPlan.filter(isRecord);
-    if (roots.length > 0) {
-      return roots;
-    }
-  }
-
-  const childRoots = getExplainNodeChildren(parsed);
-  if (childRoots.length > 0 && getExplainNodeLabel(parsed)) {
-    return [parsed];
-  }
-
-  if (getExplainNodeLabel(parsed)) {
-    return [parsed];
-  }
-
-  const nestedCandidates = ['plan', 'Plan', 'executionPlan', 'ExecutionPlan', 'profile', 'Profile'];
-  for (const key of nestedCandidates) {
-    const value = parsed[key];
-    if (!value) {
-      continue;
-    }
-    const roots = extractExplainPlanRoots(value);
-    if (roots.length > 0) {
-      return roots;
-    }
-  }
-
-  return [];
-};
-
-const classifyExplainOperation = (label: string, detail: string) => {
-  const source = `${label} ${detail}`;
-
-  if (/\b(seq(?:[_\s-]+)?scan|table(?:[_\s-]+)?scan|tablescan|remote(?:[_\s-]+)?scan|external(?:[_\s-]+)?scan|table access full|table access storage full|full table scan|distributed scan|read\b|scanfilterproject|s3(?:[_\s-]+)?scan|file(?:[_\s-]+)?scan)\b/i.test(source)) {
-    return 'scan';
-  }
-
-  if (/\b(index(?:[_\s-]+)?scan|index(?:[_\s-]+)?only(?:[_\s-]+)?scan|bitmap(?:[_\s-]+)?heap(?:[_\s-]+)?scan|bitmap(?:[_\s-]+)?index(?:[_\s-]+)?scan|index(?:[_\s-]+)?seek|clustered(?:[_\s-]+)?index(?:[_\s-]+)?scan|clustered(?:[_\s-]+)?index(?:[_\s-]+)?seek|columnstore(?:[_\s-]+)?index(?:[_\s-]+)?scan|columnstore(?:[_\s-]+)?index(?:[_\s-]+)?seek|key(?:[_\s-]+)?lookup|rid(?:[_\s-]+)?lookup|table access by index rowid|index range scan|index unique scan|index fast full scan|index full scan)\b/i.test(source)) {
-    return 'index';
-  }
-
-  if (/\b(nested(?:[_\s-]+)?loops?|nested(?:[_\s-]+)?loop|hash(?:[_\s-]+)?join|merge(?:[_\s-]+)?join|broadcast(?:[_\s-]+)?hash(?:[_\s-]+)?join|broadcast(?:[_\s-]+)?join|left(?:[_\s-]+)?semi(?:[_\s-]+)?join|right(?:[_\s-]+)?semi(?:[_\s-]+)?join|left(?:[_\s-]+)?anti(?:[_\s-]+)?join|right(?:[_\s-]+)?anti(?:[_\s-]+)?join|hash(?:[_\s-]+)?left(?:[_\s-]+)?join|hash(?:[_\s-]+)?right(?:[_\s-]+)?join|hash(?:[_\s-]+)?full(?:[_\s-]+)?join|hash match\s*\(\s*(?:inner join|left semi join|right semi join)\s*\)|left(?:[_\s-]+)?outer(?:[_\s-]+)?join|right(?:[_\s-]+)?outer(?:[_\s-]+)?join|full(?:[_\s-]+)?outer(?:[_\s-]+)?join|joinbuild|joinprobe|join\b|apply\b|ds_bcast_[a-z_]+|ds_dist_[a-z_]+|xn hash join|xn merge join|xn nested loop)\b/i.test(source)) {
-    return 'join';
-  }
-
-  if (/\b(sort|top(?:[_\s-]+)?n(?:[_\s-]+)?sort|order by|analytic[_\s-]?sort|partition(?:[_\s-]+)?sort|window(?:[_\s-]+)?sort)\b/i.test(source)) {
-    return 'sort';
-  }
-
-  if (/\b(aggregate|groupaggregate|hashaggregate|stream(?:[_\s-]+)?aggregate|hash match\s*\(\s*aggregate\s*\)|group by aggregate|scalar(?:[_\s-]+)?aggregate)\b/i.test(source)) {
-    return 'aggregate';
-  }
-
-  if (/\b(filter|predicate|qualify)\b/i.test(source)) {
-    return 'filter';
-  }
-
-  return 'other';
-};
 
 const collectAliasFilterContext = (filters: string[]) => {
   const context: Record<string, AliasFilterContext> = {};
@@ -1494,6 +377,8 @@ const describeCoverage = (coverage: ReturnType<typeof getColumnSetCoverage>) => 
   return null;
 };
 
+const formatVerificationColumns = (alias: string, columns: string[]) => `${alias}(${columns.join(', ')})`;
+
 const buildIndexHints = (
   pairs: JoinConditionPair[],
   cardinality: JoinCardinality,
@@ -1621,19 +506,38 @@ const inferJoinInsight = (
   targetSchema?: SchemaTableMetadata | null,
 ) => {
   const pairs = extractJoinConditionPairs(join);
+  const sourceToTargetPairs = pairs.map((pair) => ({
+    column: pair.sourceColumn,
+    referenceColumn: pair.targetColumn,
+  }));
+  const targetToSourcePairs = pairs.map((pair) => ({
+    column: pair.targetColumn,
+    referenceColumn: pair.sourceColumn,
+  }));
+  const sourceToTargetMatch = findForeignKeyPairMatch(sourceSchema, sourceToTargetPairs, targetSchema);
+  const targetToSourceMatch = findForeignKeyPairMatch(targetSchema, targetToSourcePairs, sourceSchema);
+  const verifiedSourceToTarget = Boolean(sourceToTargetMatch);
+  const verifiedTargetToSource = Boolean(targetToSourceMatch);
   const pairClassifications = pairs.map((pair) =>
     classifyColumnPair(pair.sourceColumn, pair.targetColumn, sourceTableName, targetTableName, sourceSchema, targetSchema),
   );
-  const hasVerifiedPair = pairs.some(
-    (pair) =>
-      hasForeignKeyMatch(sourceSchema, [pair.sourceColumn], targetSchema, [pair.targetColumn]) ||
-      hasForeignKeyMatch(targetSchema, [pair.targetColumn], sourceSchema, [pair.sourceColumn]),
-  );
+  const hasVerifiedPair =
+    verifiedSourceToTarget ||
+    verifiedTargetToSource ||
+    pairs.some(
+      (pair) =>
+        hasForeignKeyMatch(sourceSchema, [pair.sourceColumn], targetSchema, [pair.targetColumn]) ||
+        hasForeignKeyMatch(targetSchema, [pair.targetColumn], sourceSchema, [pair.sourceColumn]),
+    );
 
   const cardinality =
-    pairClassifications.length > 0 && pairClassifications.every((value) => value === pairClassifications[0])
-      ? pairClassifications[0]
-      : 'M:N';
+    verifiedSourceToTarget
+      ? 'N:1'
+      : verifiedTargetToSource
+        ? '1:N'
+        : pairClassifications.length > 0 && pairClassifications.every((value) => value === pairClassifications[0])
+          ? pairClassifications[0]
+          : 'M:N';
   const joinLabel = formatJoinTypeLabel(join.type);
   const compactCondition = truncateText(normalizeSpaces(`ON ${join.condition}`), EDGE_CONDITION_MAX);
   const fullConditionLabel = normalizeSpaces(`ON ${join.condition}`);
@@ -1650,6 +554,28 @@ const inferJoinInsight = (
   );
   const confidence = hasVerifiedPair ? 'verified' : 'heuristic';
   const confidenceLabel = hasVerifiedPair ? 'Verified' : 'Heuristic';
+  const verificationDetails =
+    sourceToTargetMatch
+      ? [
+          `Matched FOREIGN KEY ${formatVerificationColumns(join.sourceAlias, sourceToTargetMatch.foreignKey.columns)} -> ${formatVerificationColumns(join.targetAlias, sourceToTargetMatch.foreignKey.referencesColumns)}.`,
+          sourceToTargetMatch.referenceCoverage
+            ? `Target key coverage is backed by ${describeCoverage(sourceToTargetMatch.referenceCoverage)} on ${formatVerificationColumns(join.targetAlias, sourceToTargetMatch.foreignKey.referencesColumns)}.`
+            : `Target key coverage is schema-backed but does not advertise PRIMARY KEY / UNIQUE / INDEX metadata explicitly.`,
+          sourceToTargetMatch.pairCount > 1
+            ? `Composite verification matched ${sourceToTargetMatch.pairCount} join columns.`
+            : 'Single-column verification matched the imported FK exactly.',
+        ]
+      : targetToSourceMatch
+        ? [
+            `Matched FOREIGN KEY ${formatVerificationColumns(join.targetAlias, targetToSourceMatch.foreignKey.columns)} -> ${formatVerificationColumns(join.sourceAlias, targetToSourceMatch.foreignKey.referencesColumns)}.`,
+            targetToSourceMatch.referenceCoverage
+              ? `Source key coverage is backed by ${describeCoverage(targetToSourceMatch.referenceCoverage)} on ${formatVerificationColumns(join.sourceAlias, targetToSourceMatch.foreignKey.referencesColumns)}.`
+              : `Source key coverage is schema-backed but does not advertise PRIMARY KEY / UNIQUE / INDEX metadata explicitly.`,
+            targetToSourceMatch.pairCount > 1
+              ? `Composite verification matched ${targetToSourceMatch.pairCount} join columns.`
+              : 'Single-column verification matched the imported FK exactly.',
+          ]
+        : [];
 
   if (cardinality === 'N:1') {
     return {
@@ -1670,6 +596,7 @@ const inferJoinInsight = (
         : 'FK -> PK join. This is usually the healthiest join direction and tends to preserve row counts.',
       pairs,
       indexHints,
+      verificationDetails,
       fanoutSeverity: 'none',
       fanoutSummary: 'This join shape is unlikely to multiply rows on its own.',
     };
@@ -1694,6 +621,7 @@ const inferJoinInsight = (
         : 'PK -> FK join. This can multiply rows downstream, especially before aggregates.',
       pairs,
       indexHints,
+      verificationDetails,
       fanoutSeverity: 'caution',
       fanoutSummary: 'Possible row multiplication starts here and propagates to downstream joins and aggregates.',
     };
@@ -1713,1218 +641,17 @@ const inferJoinInsight = (
     summary: 'Non-key or mixed join predicates. Treat the fanout as ambiguous until you inspect it.',
     pairs,
     indexHints,
+    verificationDetails,
     fanoutSeverity: 'high',
     fanoutSummary: 'Ambiguous join keys can create fanout quickly. Validate row counts before aggregating.',
   };
-};
-
-const getFlagContent = (title: string, fallbackDescription: string) => {
-  const mapped = FLAG_COPY[title.toLowerCase()];
-  return mapped ?? { title, description: fallbackDescription };
-};
-
-const encodeBase64Url = (value: string) => {
-  const bytes = new TextEncoder().encode(value);
-  let binary = '';
-
-  bytes.forEach((byte) => {
-    binary += String.fromCharCode(byte);
-  });
-
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-};
-
-const decodeBase64Url = (value: string) => {
-  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
-  const padding = '='.repeat((4 - (normalized.length % 4 || 4)) % 4);
-  const binary = atob(`${normalized}${padding}`);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
-};
-
-const readSavedQueries = (): SavedQuery[] => {
-  if (typeof window === 'undefined') {
-    return [];
-  }
-
-  try {
-    const stored = window.localStorage.getItem(SAVED_QUERIES_KEY);
-    if (!stored) {
-      return [];
-    }
-
-    const parsed = JSON.parse(stored);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed
-      .filter((item): item is SavedQuery | (Omit<SavedQuery, 'dialect'> & { dialect?: DialectMode }) =>
-        typeof item?.id === 'string' &&
-        typeof item?.title === 'string' &&
-        typeof item?.sql === 'string' &&
-        typeof item?.updatedAt === 'number' &&
-        typeof item?.selectedStatementIndex === 'number' &&
-        (item?.dialect === undefined || isSupportedDialect(item?.dialect)),
-      )
-      .map((item) => ({
-        ...item,
-        dialect: item.dialect ?? 'postgres',
-      }));
-  } catch {
-    return [];
-  }
-};
-
-const persistSavedQueries = (queries: SavedQuery[]) => {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  window.localStorage.setItem(SAVED_QUERIES_KEY, JSON.stringify(queries));
-};
-
-const createQueryTitle = (sql: string) => {
-  const normalized = normalizeSpaces(sql);
-
-  if (!normalized) {
-    return 'Untitled query';
-  }
-
-  return truncateText(normalized, 56);
-};
-
-const createSavedQueryId = () =>
-  globalThis.crypto?.randomUUID?.() ?? `query-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-
-const createShareUrl = (sql: string, statementIndex: number, dialect: DialectMode) => {
-  if (typeof window === 'undefined') {
-    return '';
-  }
-
-  const params = new URLSearchParams();
-  params.set('sql', encodeBase64Url(sql));
-  params.set('statement', String(statementIndex));
-  params.set('dialect', dialect);
-
-  return `${window.location.origin}${window.location.pathname}#${params.toString()}`;
-};
-
-const readSharedWorkspace = (): { sql: string; selectedStatementIndex: number; dialect: DialectMode } | null => {
-  if (typeof window === 'undefined' || !window.location.hash) {
-    return null;
-  }
-
-  const params = new URLSearchParams(window.location.hash.slice(1));
-  const encodedSql = params.get('sql');
-  if (!encodedSql) {
-    return null;
-  }
-
-  try {
-    const sql = decodeBase64Url(encodedSql);
-    const selectedStatementIndex = Math.max(0, Number(params.get('statement') ?? '0') || 0);
-    const rawDialect = params.get('dialect');
-    const dialect = isSupportedDialect(rawDialect) ? rawDialect : 'postgres';
-
-    return { sql, selectedStatementIndex, dialect };
-  } catch {
-    return null;
-  }
-};
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-const isPoint = (value: unknown): value is { x: number; y: number } =>
-  isRecord(value) && typeof value.x === 'number' && typeof value.y === 'number';
-
-const sanitizeNoteRecord = (value: unknown) => {
-  if (!isRecord(value)) {
-    return {};
-  }
-
-  return Object.fromEntries(
-    Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-  );
-};
-
-const sanitizeOffsets = (value: unknown) => {
-  if (!isRecord(value)) {
-    return {};
-  }
-
-  return Object.fromEntries(
-    Object.entries(value).filter((entry): entry is [string, { x: number; y: number }] => isPoint(entry[1])),
-  );
-};
-
-const readWorkspaceViewStates = (): Record<string, WorkspaceViewState> => {
-  if (typeof window === 'undefined') {
-    return {};
-  }
-
-  try {
-    const stored = window.localStorage.getItem(WORKSPACE_VIEW_STATE_KEY);
-    if (!stored) {
-      return {};
-    }
-
-    const parsed = JSON.parse(stored);
-    if (!isRecord(parsed)) {
-      return {};
-    }
-
-    return Object.fromEntries(
-      Object.entries(parsed)
-        .map(([key, rawValue]) => {
-          if (!isRecord(rawValue)) {
-            return null;
-          }
-
-          const layoutMode =
-            rawValue.layoutMode === 'horizontal' ||
-            rawValue.layoutMode === 'vertical' ||
-            rawValue.layoutMode === 'radial'
-              ? rawValue.layoutMode
-              : 'horizontal';
-          const dialect = isSupportedDialect(rawValue.dialect) ? rawValue.dialect : 'postgres';
-          const zoom = typeof rawValue.zoom === 'number' ? rawValue.zoom : 1;
-          const updatedAt = typeof rawValue.updatedAt === 'number' ? rawValue.updatedAt : 0;
-
-          return [
-            key,
-            {
-              layoutMode,
-              dialect,
-              schemaSql: typeof rawValue.schemaSql === 'string' ? rawValue.schemaSql : '',
-              expandedDerivedIds: Array.isArray(rawValue.expandedDerivedIds)
-                ? rawValue.expandedDerivedIds.filter((item): item is string => typeof item === 'string')
-                : [],
-              nodeOffsets: sanitizeOffsets(rawValue.nodeOffsets),
-              pan: isPoint(rawValue.pan) ? rawValue.pan : { x: 0, y: 0 },
-              zoom,
-              entityNotes: sanitizeNoteRecord(rawValue.entityNotes),
-              compareSql: typeof rawValue.compareSql === 'string' ? rawValue.compareSql : '',
-              compareExplainInput: typeof rawValue.compareExplainInput === 'string' ? rawValue.compareExplainInput : '',
-              updatedAt,
-            } satisfies WorkspaceViewState,
-          ] as const;
-        })
-        .filter((entry): entry is readonly [string, WorkspaceViewState] => entry !== null),
-    );
-  } catch {
-    return {};
-  }
-};
-
-const persistWorkspaceViewStates = (states: Record<string, WorkspaceViewState>) => {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  window.localStorage.setItem(WORKSPACE_VIEW_STATE_KEY, JSON.stringify(states));
-};
-
-const createWorkspaceStateKey = (sql: string, statementIndex: number, dialect: DialectMode) => {
-  const normalized = normalizeSpaces(sql);
-  if (!normalized) {
-    return '';
-  }
-
-  const encoded = encodeBase64Url(`${dialect}:${statementIndex}:${normalized}`);
-  return `ws-${encoded.slice(0, 72)}-${normalized.length}`;
-};
-
-const saveWorkspaceViewState = (
-  key: string,
-  state: Omit<WorkspaceViewState, 'updatedAt'>,
-) => {
-  if (!key || typeof window === 'undefined') {
-    return;
-  }
-
-  const current = readWorkspaceViewStates();
-  current[key] = {
-    ...state,
-    updatedAt: Date.now(),
-  };
-
-  const trimmedEntries = Object.entries(current)
-    .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
-    .slice(0, MAX_WORKSPACE_VIEW_STATES);
-
-  persistWorkspaceViewStates(Object.fromEntries(trimmedEntries));
-};
-
-const readWorkspaceViewState = (key: string) => {
-  if (!key) {
-    return null;
-  }
-
-  return readWorkspaceViewStates()[key] ?? null;
-};
-
-const getTableLookupKeys = (table: TableRef) => [
-  table.alias.toLowerCase(),
-  table.name.toLowerCase(),
-  table.name.split('.').pop()?.toLowerCase() ?? table.name.toLowerCase(),
-];
-
-const createEmptyExplainSummary = (): ExplainSummary => ({
-  items: [],
-  relationSignals: {},
-  joinSignals: {},
-  summary: {
-    seqScans: 0,
-    indexedReads: 0,
-    joinNodes: 0,
-    sorts: 0,
-    mappedJoins: 0,
-    maxCost: 0,
-    maxRows: 0,
-    estimateWarnings: 0,
-  },
-});
-
-const deriveExplainSeverity = (defaultSeverity: ExplainSignal['severity'], costEnd?: number, rowsEstimate?: number) => {
-  if ((costEnd ?? 0) >= 1000 || (rowsEstimate ?? 0) >= 100000) {
-    return 'high';
-  }
-
-  if ((costEnd ?? 0) >= 120 || (rowsEstimate ?? 0) >= 5000) {
-    return defaultSeverity === 'low' ? 'medium' : defaultSeverity;
-  }
-
-  return defaultSeverity;
-};
-
-const createExplainContext = (tables: TableRef[]) => {
-  const tableIndex = new Map<string, Set<string>>();
-
-  tables.forEach((table) => {
-    getTableLookupKeys(table)
-      .map((key) => cleanColumnName(key).toLowerCase())
-      .filter(Boolean)
-      .forEach((key) => {
-        const aliases = tableIndex.get(key) ?? new Set<string>();
-        aliases.add(table.alias);
-        tableIndex.set(key, aliases);
-      });
-  });
-
-  return {
-    getAliasesForRelation: (relationName: string) => {
-      const normalized = cleanColumnName(relationName).toLowerCase();
-      const shortName = normalized.split('.').pop() ?? normalized;
-      const aliases = new Set<string>();
-
-      (tableIndex.get(normalized) ?? new Set()).forEach((alias) => aliases.add(alias));
-      (tableIndex.get(shortName) ?? new Set()).forEach((alias) => aliases.add(alias));
-
-      return Array.from(aliases);
-    },
-  };
-};
-
-const mapJoinSignals = (
-  items: ExplainSignal[],
-  relationSignals: Record<string, ExplainSignal[]>,
-  joins: JoinRef[],
-) => {
-  const joinSignals: Record<string, ExplainSignal[]> = {};
-  const pushSignal = (key: string, signal: ExplainSignal) => {
-    const nextList = joinSignals[key] ?? [];
-    if (nextList.some((existing) => existing.id === signal.id)) {
-      return;
-    }
-    joinSignals[key] = [...nextList, signal];
-  };
-
-  items.forEach((signal) => {
-    const normalizedTitle = signal.title.toLowerCase();
-    if (!normalizedTitle.includes('join') && !normalizedTitle.includes('loop')) {
-      return;
-    }
-
-    let matchedJoinIds = signal.joinIds ?? [];
-
-    if (matchedJoinIds.length === 0 && signal.relationAliases && signal.relationAliases.length >= 2) {
-      const aliasSet = new Set(signal.relationAliases);
-      matchedJoinIds = joins
-        .filter((join) => aliasSet.has(join.sourceAlias) && aliasSet.has(join.targetAlias))
-        .map((join) => join.id);
-    }
-
-    if (matchedJoinIds.length === 0) {
-      const nearbyAliases = new Set<string>();
-
-      Object.entries(relationSignals).forEach(([alias, signals]) => {
-        if (signals.some((candidate) => candidate.id === signal.id)) {
-          nearbyAliases.add(alias);
-        }
-      });
-
-      if (nearbyAliases.size >= 2) {
-        matchedJoinIds = joins
-          .filter((join) => nearbyAliases.has(join.sourceAlias) && nearbyAliases.has(join.targetAlias))
-          .map((join) => join.id);
-      }
-    }
-
-    matchedJoinIds.forEach((joinId) => {
-      pushSignal(joinId, { ...signal, joinIds: matchedJoinIds });
-    });
-  });
-
-  return joinSignals;
-};
-
-const parseSqlServerShowplanXml = (input: string, tables: TableRef[], joins: JoinRef[]): ExplainSummary | null => {
-  if (!/showplanxml/i.test(input) || typeof DOMParser === 'undefined') {
-    return null;
-  }
-
-  let documentRoot: Document;
-
-  try {
-    documentRoot = new DOMParser().parseFromString(input, 'application/xml');
-  } catch {
-    return null;
-  }
-
-  if (documentRoot.querySelector('parsererror')) {
-    return null;
-  }
-
-  const relOps = Array.from(documentRoot.getElementsByTagName('RelOp'));
-  if (relOps.length === 0) {
-    return null;
-  }
-
-  const { getAliasesForRelation } = createExplainContext(tables);
-  const relationSignals: Record<string, ExplainSignal[]> = {};
-  const items: ExplainSignal[] = [];
-  let seqScans = 0;
-  let indexedReads = 0;
-  let joinNodes = 0;
-  let sorts = 0;
-  let maxCost = 0;
-  let maxRows = 0;
-  let estimateWarnings = 0;
-  let counter = 0;
-
-  const pushRelationSignal = (alias: string, signal: ExplainSignal) => {
-    const nextList = relationSignals[alias] ?? [];
-    if (nextList.some((existing) => existing.id === signal.id)) {
-      return;
-    }
-    relationSignals[alias] = [...nextList, signal];
-  };
-
-  relOps.forEach((relOp) => {
-    const physicalOp = relOp.getAttribute('PhysicalOp')?.trim() ?? '';
-    const logicalOp = relOp.getAttribute('LogicalOp')?.trim() ?? '';
-    const estimateRowsRaw = Number(relOp.getAttribute('EstimateRows'));
-    const subtreeCostRaw = Number(relOp.getAttribute('EstimatedTotalSubtreeCost'));
-    const actualRowsRaw = Number(relOp.querySelector('RunTimeCountersPerThread')?.getAttribute('ActualRows'));
-    const actualExecutionsRaw = Number(relOp.querySelector('RunTimeCountersPerThread')?.getAttribute('ActualExecutions'));
-    const costEnd = Number.isFinite(subtreeCostRaw) ? subtreeCostRaw : undefined;
-    const rowsEstimate = Number.isFinite(estimateRowsRaw) ? estimateRowsRaw : undefined;
-    const actualRows = Number.isFinite(actualRowsRaw) ? actualRowsRaw : undefined;
-    const loops = Number.isFinite(actualExecutionsRaw) ? actualExecutionsRaw : undefined;
-    const objectNodes = Array.from(relOp.getElementsByTagName('Object'));
-    const relationNames = objectNodes
-      .map((node) => {
-        const table = node.getAttribute('Table');
-        const schema = node.getAttribute('Schema');
-        const database = node.getAttribute('Database');
-        const alias = node.getAttribute('Alias');
-        const relation = [database, schema, table].filter(Boolean).join('.');
-        return cleanExplainRelationName(relation || alias || '');
-      })
-      .filter(Boolean);
-    const descendantAliases = new Set<string>();
-
-    relationNames.forEach((relationName) => {
-      getAliasesForRelation(relationName).forEach((alias) => descendantAliases.add(alias));
-    });
-
-    const estimateFactor = getEstimateFactor(rowsEstimate, actualRows);
-    if (getEstimateSeverity(estimateFactor) && getEstimateSeverity(estimateFactor) !== 'low') {
-      estimateWarnings += 1;
-    }
-
-    if (costEnd !== undefined) {
-      maxCost = Math.max(maxCost, costEnd);
-    }
-
-    if (rowsEstimate !== undefined) {
-      maxRows = Math.max(maxRows, rowsEstimate);
-    }
-
-    const opLabel = physicalOp || logicalOp;
-    const baseDetail = relationNames.length > 0 ? `${opLabel} on ${relationNames.join(', ')}` : opLabel;
-    let signal: ExplainSignal | null = null;
-
-    if (/(table scan|clustered index scan|scan)$/i.test(physicalOp) && !/index seek|key lookup|rid lookup/i.test(physicalOp)) {
-      seqScans += 1;
-      signal = {
-        id: `xml-seq-${counter += 1}`,
-        severity: deriveExplainSeverity('high', costEnd, rowsEstimate),
-        title: physicalOp || logicalOp || 'Table Scan',
-        detail: baseDetail,
-        relationName: relationNames[0],
-        relationAliases: Array.from(descendantAliases),
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        estimateFactor,
-      };
-    } else if (/index seek|index scan|key lookup|rid lookup|columnstore/i.test(physicalOp)) {
-      indexedReads += 1;
-      signal = {
-        id: `xml-index-${counter += 1}`,
-        severity: deriveExplainSeverity('low', costEnd, rowsEstimate),
-        title: physicalOp || logicalOp || 'Index access',
-        detail: baseDetail,
-        relationName: relationNames[0],
-        relationAliases: Array.from(descendantAliases),
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        estimateFactor,
-      };
-    } else if (/join|nested loops|apply|merge/i.test(physicalOp) || /join/i.test(logicalOp)) {
-      joinNodes += 1;
-      signal = {
-        id: `xml-join-${counter += 1}`,
-        severity: deriveExplainSeverity(/nested loops/i.test(physicalOp) ? 'high' : 'medium', costEnd, rowsEstimate),
-        title: physicalOp || logicalOp || 'Join',
-        detail: baseDetail,
-        relationAliases: Array.from(descendantAliases),
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        estimateFactor,
-      };
-    } else if (/sort/i.test(physicalOp) || /sort/i.test(logicalOp)) {
-      sorts += 1;
-      signal = {
-        id: `xml-sort-${counter += 1}`,
-        severity: deriveExplainSeverity('medium', costEnd, rowsEstimate),
-        title: physicalOp || logicalOp || 'Sort',
-        detail: baseDetail,
-        relationAliases: Array.from(descendantAliases),
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        estimateFactor,
-      };
-    }
-
-    if (signal) {
-      items.push(signal);
-      Array.from(descendantAliases).forEach((alias) => pushRelationSignal(alias, signal as ExplainSignal));
-    }
-  });
-
-  const joinSignals = mapJoinSignals(items, relationSignals, joins);
-
-  return {
-    items,
-    relationSignals,
-    joinSignals,
-    summary: {
-      seqScans,
-      indexedReads,
-      joinNodes,
-      sorts,
-      mappedJoins: Object.keys(joinSignals).length,
-      maxCost,
-      maxRows,
-      estimateWarnings,
-    },
-  };
-};
-
-const parseExplainJsonInput = (input: string, tables: TableRef[], joins: JoinRef[]): ExplainSummary | null => {
-  if (!/^(?:\[|{)/.test(input.trim())) {
-    return null;
-  }
-
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(input);
-  } catch {
-    return null;
-  }
-
-  const roots = extractExplainPlanRoots(parsed);
-  if (roots.length === 0) {
-    return null;
-  }
-
-  const { getAliasesForRelation } = createExplainContext(tables);
-  const relationSignals: Record<string, ExplainSignal[]> = {};
-  const items: ExplainSignal[] = [];
-  let seqScans = 0;
-  let indexedReads = 0;
-  let joinNodes = 0;
-  let sorts = 0;
-  let maxCost = 0;
-  let maxRows = 0;
-  let estimateWarnings = 0;
-  let counter = 0;
-
-  const pushRelationSignal = (alias: string, signal: ExplainSignal) => {
-    const nextList = relationSignals[alias] ?? [];
-    if (nextList.some((existing) => existing.id === signal.id)) {
-      return;
-    }
-    relationSignals[alias] = [...nextList, signal];
-  };
-
-  const visit = (node: Record<string, unknown>): Set<string> => {
-    const nodeType = getExplainNodeLabel(node);
-    const relationName = getExplainRelationNameFromNode(node);
-    const costStart = getExplainNumericValue(node, ['Startup Cost', 'StartupCost', 'startupCost', 'startCost']);
-    const costEnd = getExplainNumericValue(node, [
-      'Total Cost',
-      'TotalCost',
-      'totalCost',
-      'cumulativeCost',
-      'cost',
-      'estimatedCost',
-      'bytesRead',
-      'estimatedBytesRead',
-    ]);
-    const rowsEstimate = getExplainNumericValue(node, [
-      'Plan Rows',
-      'PlanRows',
-      'planRows',
-      'rows',
-      'Rows',
-      'estimatedRows',
-      'EstimatedRows',
-      'recordsRead',
-      'statistics.rows',
-    ]);
-    const actualRows =
-      getExplainNumericValue(node, ['Actual Rows', 'ActualRows', 'actualRows', 'recordsWritten']) ??
-      (isRecord(node.statistics) ? getExplainNumericValue(node.statistics, ['outputRows', 'rowsProduced']) : undefined);
-    const loops = getExplainNumericValue(node, ['Actual Loops', 'ActualLoops', 'actualLoops', 'loops']);
-    const actualTimeEnd = getExplainNumericValue(node, [
-      'Actual Total Time',
-      'ActualTotalTime',
-      'actualTotalTime',
-      'elapsedMs',
-      'elapsedTime',
-      'executionTime',
-    ]);
-    const estimateFactor = getEstimateFactor(rowsEstimate, actualRows);
-    const childPlans = getExplainNodeChildren(node);
-    const relationAliases = relationName ? getAliasesForRelation(relationName) : [];
-    const descendantAliases = new Set<string>(relationAliases);
-
-    childPlans.forEach((child) => {
-      visit(child).forEach((alias) => descendantAliases.add(alias));
-    });
-
-    let signal: ExplainSignal | null = null;
-    const baseDetail = `${nodeType}${relationName ? ` on ${relationName}` : ''}`;
-    const operationKind = classifyExplainOperation(nodeType, baseDetail);
-
-    if (operationKind === 'scan') {
-      seqScans += 1;
-      signal = {
-        id: `json-seq-${counter += 1}`,
-        severity: deriveExplainSeverity('high', costEnd, rowsEstimate),
-        title: nodeType || 'Seq Scan',
-        detail: baseDetail,
-        relationName,
-        relationAliases,
-        costStart,
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        actualTimeEnd,
-        estimateFactor,
-      };
-    } else if (operationKind === 'index') {
-      indexedReads += 1;
-      signal = {
-        id: `json-index-${counter += 1}`,
-        severity: deriveExplainSeverity('low', costEnd, rowsEstimate),
-        title: nodeType || 'Index access',
-        detail: baseDetail,
-        relationName,
-        relationAliases,
-        costStart,
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        actualTimeEnd,
-        estimateFactor,
-      };
-    } else if (operationKind === 'join') {
-      joinNodes += 1;
-      signal = {
-        id: `json-join-${counter += 1}`,
-        severity: deriveExplainSeverity(/nested loop/i.test(nodeType) ? 'high' : 'medium', costEnd, rowsEstimate),
-        title: nodeType || 'Join',
-        detail: baseDetail,
-        relationAliases: Array.from(descendantAliases),
-        costStart,
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        actualTimeEnd,
-        estimateFactor,
-      };
-    } else if (operationKind === 'sort') {
-      sorts += 1;
-      signal = {
-        id: `json-sort-${counter += 1}`,
-        severity: deriveExplainSeverity('medium', costEnd, rowsEstimate),
-        title: nodeType || 'Sort',
-        detail: baseDetail,
-        relationAliases: Array.from(descendantAliases),
-        costStart,
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        actualTimeEnd,
-        estimateFactor,
-      };
-    } else if (operationKind === 'aggregate') {
-      signal = {
-        id: `json-agg-${counter += 1}`,
-        severity: deriveExplainSeverity('low', costEnd, rowsEstimate),
-        title: nodeType || 'Aggregate',
-        detail: baseDetail,
-        relationAliases: Array.from(descendantAliases),
-        costStart,
-        costEnd,
-        rowsEstimate,
-        actualRows,
-        loops,
-        actualTimeEnd,
-        estimateFactor,
-      };
-    }
-
-    if (getEstimateSeverity(estimateFactor) && getEstimateSeverity(estimateFactor) !== 'low') {
-      estimateWarnings += 1;
-    }
-
-    if (costEnd !== undefined) {
-      maxCost = Math.max(maxCost, costEnd);
-    }
-
-    if (rowsEstimate !== undefined) {
-      maxRows = Math.max(maxRows, rowsEstimate);
-    }
-
-    if (signal) {
-      items.push(signal);
-      relationAliases.forEach((alias) => {
-        pushRelationSignal(alias, signal as ExplainSignal);
-      });
-    }
-
-    return descendantAliases;
-  };
-
-  roots.forEach((root) => {
-    visit(root);
-  });
-  const joinSignals = mapJoinSignals(items, relationSignals, joins);
-
-  return {
-    items,
-    relationSignals,
-    joinSignals,
-    summary: {
-      seqScans,
-      indexedReads,
-      joinNodes,
-      sorts,
-      mappedJoins: Object.keys(joinSignals).length,
-      maxCost,
-      maxRows,
-      estimateWarnings,
-    },
-  };
-};
-
-const parseExplainInput = (input: string, tables: TableRef[], joins: JoinRef[]): ExplainSummary => {
-  const trimmed = input.trim();
-  if (!trimmed) {
-    return createEmptyExplainSummary();
-  }
-
-  const sqlServerXmlSummary = parseSqlServerShowplanXml(trimmed, tables, joins);
-  if (sqlServerXmlSummary) {
-    return sqlServerXmlSummary;
-  }
-
-  const jsonSummary = parseExplainJsonInput(trimmed, tables, joins);
-  if (jsonSummary) {
-    return jsonSummary;
-  }
-
-  const relationSignals: Record<string, ExplainSignal[]> = {};
-  const joinSignals: Record<string, ExplainSignal[]> = {};
-  const items: ExplainSignal[] = [];
-  let seqScans = 0;
-  let indexedReads = 0;
-  let joinNodes = 0;
-  let sorts = 0;
-  let maxCost = 0;
-  let maxRows = 0;
-  let estimateWarnings = 0;
-
-  const { getAliasesForRelation } = createExplainContext(tables);
-
-  const pushSignal = (
-    record: Record<string, ExplainSignal[]>,
-    key: string,
-    signal: ExplainSignal,
-  ) => {
-    const nextList = record[key] ?? [];
-    if (nextList.some((existing) => existing.id === signal.id)) {
-      return;
-    }
-
-    record[key] = [...nextList, signal];
-  };
-
-  const rawEntries = trimmed
-    .split(/\r?\n/)
-    .map((rawLine, index) => ({
-      rawLine,
-      line: normalizeSpaces(rawLine),
-      indent: Math.max(0, rawLine.search(/[A-Za-z[]/)),
-      index,
-    }))
-    .filter((entry) => entry.line.length > 0);
-
-  const nodes: Array<{
-    id: string;
-    line: string;
-    indent: number;
-    kind: 'scan' | 'join' | 'operation' | 'other';
-    signal: ExplainSignal | null;
-    relationAliases: string[];
-    childIndices: number[];
-    descendantAliases: Set<string>;
-  }> = [];
-  const stack: number[] = [];
-
-  rawEntries.forEach((entry) => {
-    const relationName = extractExplainRelationName(entry.line);
-    const seqMatch = entry.line.match(/\b((?:XN|DS_[A-Z_]+)?\s*Seq Scan|Table Scan|TableScan|Remote Scan|External Scan|TABLE ACCESS FULL|TABLE ACCESS STORAGE FULL|Full Table Scan|Distributed Scan|READ|S3 Scan|File Scan|ScanFilterProject)\b/i);
-    const indexMatch = entry.line.match(/\b(Index Scan|Index Only Scan|Bitmap Heap Scan|Bitmap Index Scan|Index Seek|Clustered Index Scan|Clustered Index Seek|Columnstore Index Scan|Columnstore Index Seek|Key Lookup|RID Lookup|TABLE ACCESS BY INDEX ROWID|INDEX RANGE SCAN|INDEX UNIQUE SCAN|INDEX FAST FULL SCAN|INDEX FULL SCAN)\b/i);
-    const nestedLoopMatch = entry.line.match(/\b(Nested Loops?|Hash Join|Merge Join|Broadcast Hash Join|Broadcast Join|Left Semi Join|Right Semi Join|Left Anti Join|Right Anti Join|Hash Left Join|Hash Right Join|Hash Full Join|Hash Match\s*\(\s*(?:Inner Join|Left Semi Join|Right Semi Join)\s*\)|Left Outer Join|Right Outer Join|Full Outer Join|JoinBuild|JoinProbe|DS_BCAST_[A-Z_]+|DS_DIST_[A-Z_]+|XN Hash Join|XN Merge Join|XN Nested Loop)\b/i);
-    const sortMatch = entry.line.match(/\b(Sort|Top N Sort|Order By|ANALYTIC_SORT|Window Sort)\b/i);
-    const aggregateMatch = entry.line.match(/\b(Aggregate|GroupAggregate|HashAggregate|Stream Aggregate|Hash Match\s*\(\s*Aggregate\s*\)|Scalar Aggregate)\b/i);
-    const filterMatch = entry.line.match(/\bRows Removed by Filter:\s*([\d,]+)/i);
-    const costRowsMatch = entry.line.match(/\bcost=([0-9.,]+)\.\.([0-9.,]+)\s+rows=([0-9.,]+)/i);
-    const sqlServerCostMatch = entry.line.match(/\bEstimated Total Subtree Cost\s*=\s*([0-9.,]+)/i);
-    const sqlServerRowsMatch = entry.line.match(/\bEstimated Number of Rows\s*=\s*([0-9.,]+)/i);
-    const actualRowsMatch = entry.line.match(/\bactual [^)]+ rows=([0-9.,]+)\s+loops=([0-9.,]+)/i);
-    const oracleRowsMatch = entry.line.match(/\bA-Rows\s*[:=]?\s*([0-9.,]+)\b/i);
-    const oracleEstimateRowsMatch = entry.line.match(/\bE-Rows\s*[:=]?\s*([0-9.,]+)\b/i);
-    const costStart = costRowsMatch ? Number(costRowsMatch[1].replace(/,/g, '')) : undefined;
-    const costEnd = costRowsMatch
-      ? Number(costRowsMatch[2].replace(/,/g, ''))
-      : sqlServerCostMatch
-        ? Number(sqlServerCostMatch[1].replace(/,/g, ''))
-        : undefined;
-    const rowsEstimate = costRowsMatch
-      ? Number(costRowsMatch[3].replace(/,/g, ''))
-      : sqlServerRowsMatch
-        ? Number(sqlServerRowsMatch[1].replace(/,/g, ''))
-        : oracleEstimateRowsMatch
-          ? Number(oracleEstimateRowsMatch[1].replace(/,/g, ''))
-        : undefined;
-    const actualRows = actualRowsMatch ? Number(actualRowsMatch[1].replace(/,/g, '')) : undefined;
-    const loops = actualRowsMatch ? Number(actualRowsMatch[2].replace(/,/g, '')) : undefined;
-    const actualTimeMatch = entry.line.match(/\bactual [a-z ]*=([0-9.,]+)\.\.([0-9.,]+)/i);
-    const actualTimeEnd = actualTimeMatch ? Number(actualTimeMatch[2].replace(/,/g, '')) : undefined;
-    const resolvedActualRows =
-      actualRows !== undefined
-        ? actualRows
-        : oracleRowsMatch
-          ? Number(oracleRowsMatch[1].replace(/,/g, ''))
-          : undefined;
-    const estimateFactor = getEstimateFactor(rowsEstimate, resolvedActualRows);
-    const heatSeverity =
-      costEnd !== undefined || rowsEstimate !== undefined
-        ? (costEnd !== undefined && costEnd >= 1000) || (rowsEstimate !== undefined && rowsEstimate >= 100000)
-          ? 'high'
-          : (costEnd !== undefined && costEnd >= 120) || (rowsEstimate !== undefined && rowsEstimate >= 5000)
-            ? 'medium'
-            : 'low'
-        : null;
-    let signal: ExplainSignal | null = null;
-    let kind: 'scan' | 'join' | 'operation' | 'other' = 'other';
-    let relationAliases: string[] = [];
-
-    if (seqMatch) {
-      seqScans += 1;
-      relationAliases = relationName ? getAliasesForRelation(relationName) : [];
-        signal = {
-          id: `seq-${entry.index}`,
-          severity: 'high',
-          title: seqMatch[1],
-          detail: entry.line,
-          relationName: relationName ?? undefined,
-          relationAliases,
-          costStart,
-          costEnd,
-          rowsEstimate,
-          actualRows: resolvedActualRows,
-          loops,
-          actualTimeEnd,
-          estimateFactor,
-        };
-        kind = 'scan';
-      } else if (indexMatch) {
-        indexedReads += 1;
-        relationAliases = relationName ? getAliasesForRelation(relationName) : [];
-        signal = {
-          id: `index-${entry.index}`,
-          severity: heatSeverity === 'high' ? 'high' : heatSeverity === 'medium' ? 'medium' : 'low',
-          title: indexMatch[1],
-          detail: entry.line,
-          relationName: relationName ?? undefined,
-          relationAliases,
-          costStart,
-          costEnd,
-          rowsEstimate,
-          actualRows: resolvedActualRows,
-          loops,
-          actualTimeEnd,
-          estimateFactor,
-        };
-        kind = 'scan';
-      } else if (nestedLoopMatch) {
-        joinNodes += 1;
-        signal = {
-          id: `join-${entry.index}`,
-          severity:
-            heatSeverity === 'high'
-              ? 'high'
-              : nestedLoopMatch[1].toLowerCase() === 'nested loop'
-                ? 'high'
-                : 'medium',
-          title: nestedLoopMatch[1],
-          detail: entry.line,
-          costStart,
-          costEnd,
-          rowsEstimate,
-          actualRows: resolvedActualRows,
-          loops,
-          actualTimeEnd,
-          estimateFactor,
-        };
-        kind = 'join';
-      } else if (sortMatch) {
-        sorts += 1;
-        signal = {
-          id: `sort-${entry.index}`,
-          severity: heatSeverity === 'high' ? 'high' : 'medium',
-          title: 'Sort',
-          detail: entry.line,
-          costStart,
-          costEnd,
-          rowsEstimate,
-          actualRows: resolvedActualRows,
-          loops,
-          actualTimeEnd,
-          estimateFactor,
-        };
-        kind = 'operation';
-      } else if (aggregateMatch) {
-        signal = {
-          id: `agg-${entry.index}`,
-          severity: heatSeverity === 'high' ? 'high' : heatSeverity === 'medium' ? 'medium' : 'low',
-          title: aggregateMatch[1],
-          detail: entry.line,
-          costStart,
-          costEnd,
-          rowsEstimate,
-          actualRows: resolvedActualRows,
-          loops,
-          actualTimeEnd,
-          estimateFactor,
-        };
-        kind = 'operation';
-      } else if (/\b(Filter|Predicate)\b/i.test(entry.line)) {
-        signal = {
-          id: `filter-${entry.index}`,
-          severity: heatSeverity === 'high' ? 'high' : 'medium',
-          title: 'Filter',
-          detail: entry.line,
-          relationName: relationName ?? undefined,
-          relationAliases: relationName ? getAliasesForRelation(relationName) : [],
-          costStart,
-          costEnd,
-          rowsEstimate,
-          actualRows: resolvedActualRows,
-          loops,
-          actualTimeEnd,
-          estimateFactor,
-        };
-        kind = 'operation';
-      } else if (filterMatch) {
-        signal = {
-          id: `filter-${entry.index}`,
-          severity: heatSeverity === 'high' ? 'high' : 'medium',
-          title: 'Rows Removed by Filter',
-          detail: entry.line,
-          costStart,
-          costEnd,
-          rowsEstimate,
-          actualRows: resolvedActualRows,
-          loops,
-          actualTimeEnd,
-          estimateFactor,
-        };
-        kind = 'operation';
-      }
-
-    if (getEstimateSeverity(estimateFactor) && getEstimateSeverity(estimateFactor) !== 'low') {
-      estimateWarnings += 1;
-    }
-
-    if (costEnd !== undefined) {
-      maxCost = Math.max(maxCost, costEnd);
-    }
-
-    if (rowsEstimate !== undefined) {
-      maxRows = Math.max(maxRows, rowsEstimate);
-    }
-
-    const nextNode = {
-      id: `plan-${entry.index}`,
-      line: entry.line,
-      indent: entry.indent,
-      kind,
-      signal,
-      relationAliases,
-      childIndices: [] as number[],
-      descendantAliases: new Set<string>(relationAliases),
-    };
-
-    while (stack.length > 0 && nextNode.indent <= nodes[stack[stack.length - 1]].indent) {
-      stack.pop();
-    }
-
-    if (stack.length > 0) {
-      nodes[stack[stack.length - 1]].childIndices.push(nodes.length);
-    }
-
-    nodes.push(nextNode);
-    stack.push(nodes.length - 1);
-  });
-
-  for (let index = nodes.length - 1; index >= 0; index -= 1) {
-    nodes[index].childIndices.forEach((childIndex) => {
-      nodes[childIndex].descendantAliases.forEach((alias) => {
-        nodes[index].descendantAliases.add(alias);
-      });
-    });
-  }
-
-  nodes.forEach((node, nodeIndex) => {
-    if (!node.signal) {
-      return;
-    }
-
-    items.push(node.signal);
-
-    node.relationAliases.forEach((alias) => {
-      pushSignal(relationSignals, alias, node.signal as ExplainSignal);
-    });
-
-    if (node.kind !== 'join') {
-      return;
-    }
-
-    const childAliasGroups = node.childIndices
-      .map((childIndex) => nodes[childIndex].descendantAliases)
-      .filter((aliases) => aliases.size > 0);
-
-    let matchedJoinIds: string[] = [];
-
-    if (childAliasGroups.length >= 2) {
-      const leftAliases = childAliasGroups[0];
-      const rightAliases = new Set<string>();
-
-      childAliasGroups.slice(1).forEach((aliases) => {
-        aliases.forEach((alias) => rightAliases.add(alias));
-      });
-
-      matchedJoinIds = joins
-        .filter(
-          (join) =>
-            (leftAliases.has(join.sourceAlias) && rightAliases.has(join.targetAlias)) ||
-            (leftAliases.has(join.targetAlias) && rightAliases.has(join.sourceAlias)),
-        )
-        .map((join) => join.id);
-    }
-
-    if (matchedJoinIds.length === 0 && node.descendantAliases.size >= 2) {
-      matchedJoinIds = joins
-        .filter(
-          (join) =>
-            node.descendantAliases.has(join.sourceAlias) &&
-            node.descendantAliases.has(join.targetAlias),
-        )
-        .map((join) => join.id);
-    }
-
-    if (matchedJoinIds.length === 0) {
-      const nearbyAliases = new Set<string>();
-
-      nodes
-        .slice(Math.max(0, nodeIndex - 2), Math.min(nodes.length, nodeIndex + 5))
-        .forEach((candidate) => {
-          if (candidate.kind !== 'scan') {
-            return;
-          }
-
-          candidate.relationAliases.forEach((alias) => nearbyAliases.add(alias));
-        });
-
-      if (nearbyAliases.size >= 2) {
-        matchedJoinIds = joins
-          .filter(
-            (join) =>
-              nearbyAliases.has(join.sourceAlias) &&
-              nearbyAliases.has(join.targetAlias),
-          )
-          .map((join) => join.id);
-      }
-    }
-
-    const joinSignal: ExplainSignal = {
-      ...node.signal,
-      joinIds: matchedJoinIds,
-      relationAliases: Array.from(node.descendantAliases),
-    };
-
-    matchedJoinIds.forEach((joinId) => {
-      pushSignal(joinSignals, joinId, joinSignal);
-    });
-  });
-
-  return {
-    items,
-    relationSignals,
-    joinSignals,
-    summary: {
-      seqScans,
-      indexedReads,
-      joinNodes,
-      sorts,
-      mappedJoins: Object.keys(joinSignals).length,
-      maxCost,
-      maxRows,
-      estimateWarnings,
-    },
-  };
-};
-
-const getStrongestExplainSignal = (signals: ExplainSignal[] | undefined) => {
-  if (!signals || signals.length === 0) {
-    return null;
-  }
-
-  const severityRank: Record<ExplainSignal['severity'], number> = {
-    high: 3,
-    medium: 2,
-    low: 1,
-  };
-
-  return [...signals].sort((left, right) => {
-    const severityDelta = severityRank[right.severity] - severityRank[left.severity];
-    if (severityDelta !== 0) {
-      return severityDelta;
-    }
-
-    const costDelta = (right.costEnd ?? 0) - (left.costEnd ?? 0);
-    if (costDelta !== 0) {
-      return costDelta;
-    }
-
-    return (right.rowsEstimate ?? 0) - (left.rowsEstimate ?? 0);
-  })[0];
 };
 
 const getNodeNoteKey = (alias: string) => `node:${alias}`;
 
 const getJoinNoteKey = (joinId: string) => `join:${joinId}`;
 
-const formatSignedDelta = (value: number) => (value > 0 ? `+${value}` : `${value}`);
-
-const buildJoinComparisonLabel = (join: JoinRef) =>
-  `${formatJoinTypeLabel(join.type)} ${join.sourceAlias} -> ${join.targetAlias} / ${normalizeSpaces(`ON ${join.condition}`)}`;
-
-const buildCompareSummary = (
-  currentAnalysis: ReturnType<typeof analyzeSql>,
-  currentPlan: ExplainSummary,
-  baselineAnalysis: ReturnType<typeof analyzeSql>,
-  baselinePlan: ExplainSummary,
-): CompareSummary => {
-  const currentTables = Array.from(new Set(currentAnalysis.tables.map((table) => `${table.alias} (${table.name})`))).sort();
-  const baselineTables = Array.from(new Set(baselineAnalysis.tables.map((table) => `${table.alias} (${table.name})`))).sort();
-  const currentJoins = Array.from(new Set(currentAnalysis.joins.map((join) => buildJoinComparisonLabel(join)))).sort();
-  const baselineJoins = Array.from(new Set(baselineAnalysis.joins.map((join) => buildJoinComparisonLabel(join)))).sort();
-  const currentFlags = Array.from(new Set(currentAnalysis.flags.map((flag) => getFlagContent(flag.title, flag.description).title))).sort();
-  const baselineFlags = Array.from(new Set(baselineAnalysis.flags.map((flag) => getFlagContent(flag.title, flag.description).title))).sort();
-
-  const addedTables = currentTables.filter((item) => !baselineTables.includes(item));
-  const removedTables = baselineTables.filter((item) => !currentTables.includes(item));
-  const addedJoins = currentJoins.filter((item) => !baselineJoins.includes(item));
-  const removedJoins = baselineJoins.filter((item) => !currentJoins.includes(item));
-  const addedFlags = currentFlags.filter((item) => !baselineFlags.includes(item));
-  const removedFlags = baselineFlags.filter((item) => !currentFlags.includes(item));
-  const hasPlanComparison = baselinePlan.items.length > 0 || currentPlan.items.length > 0;
-
-  return {
-    tableDelta: currentAnalysis.tables.length - baselineAnalysis.tables.length,
-    joinDelta: currentAnalysis.joins.length - baselineAnalysis.joins.length,
-    flagDelta: currentAnalysis.flags.length - baselineAnalysis.flags.length,
-    complexityDelta: currentAnalysis.complexityScore - baselineAnalysis.complexityScore,
-    planSignalDelta: currentPlan.items.length - baselinePlan.items.length,
-    seqScanDelta: currentPlan.summary.seqScans - baselinePlan.summary.seqScans,
-    joinNodeDelta: currentPlan.summary.joinNodes - baselinePlan.summary.joinNodes,
-    maxCostDelta:
-      hasPlanComparison ? currentPlan.summary.maxCost - baselinePlan.summary.maxCost : null,
-    maxRowsDelta:
-      hasPlanComparison ? currentPlan.summary.maxRows - baselinePlan.summary.maxRows : null,
-    addedTables,
-    removedTables,
-    addedJoins,
-    removedJoins,
-    addedFlags,
-    removedFlags,
-    hasPlanComparison,
-  };
-};
+const getFlagNoteKey = (title: string) => `flag:${title}`;
 
 const buildFanoutState = (joins: JoinRef[], joinInsights: Record<string, JoinInsight>) => {
   const aliasImpacts: Record<string, FanoutImpact> = {};
@@ -2972,14 +699,15 @@ const buildFanoutState = (joins: JoinRef[], joinInsights: Record<string, JoinIns
 };
 
 function App() {
+  const defaultSql = getDialectSampleSql('postgres');
   const sharedWorkspace = readSharedWorkspace();
-  const [sql, setSql] = useState(sharedWorkspace?.sql ?? POSTGRES_SAMPLE_SQL);
+  const [sql, setSql] = useState(sharedWorkspace?.sql ?? defaultSql);
   const [selectedStatementIndex, setSelectedStatementIndex] = useState(sharedWorkspace?.selectedStatementIndex ?? 0);
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>(() => readSavedQueries());
   const [dialect, setDialect] = useState<DialectMode>(
-    sharedWorkspace?.dialect ?? detectSqlDialect(sharedWorkspace?.sql ?? POSTGRES_SAMPLE_SQL).dialect,
+    sharedWorkspace?.dialect ?? detectSqlDialect(sharedWorkspace?.sql ?? defaultSql).dialect,
   );
-  const [schemaSql, setSchemaSql] = useState('');
+  const [schemaSql, setSchemaSql] = useState(sharedWorkspace?.schemaSql ?? '');
   const [layoutMode, setLayoutMode] = useState<LayoutMode>('horizontal');
   const [expandedDerivedIds, setExpandedDerivedIds] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -2991,9 +719,12 @@ function App() {
   const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
   const [selectedJoinId, setSelectedJoinId] = useState<string | null>(null);
   const [selectedLineageId, setSelectedLineageId] = useState<string | null>(null);
-  const [detailTab, setDetailTab] = useState<DetailTab>('joins');
+  const [detailTab, setDetailTab] = useState<DetailTab>(sharedWorkspace?.mode === 'review' ? 'review' : 'joins');
   const [nodeOffsets, setNodeOffsets] = useState<Record<string, { x: number; y: number }>>({});
-  const [entityNotes, setEntityNotes] = useState<Record<string, string>>({});
+  const [entityNotes, setEntityNotes] = useState<Record<string, string>>(sharedWorkspace?.entityNotes ?? {});
+  const [reviewStatus, setReviewStatus] = useState<ReviewStatus>(sharedWorkspace?.reviewStatus ?? 'draft');
+  const [reviewSummary, setReviewSummary] = useState(sharedWorkspace?.reviewSummary ?? '');
+  const [isReadOnlyReview, setIsReadOnlyReview] = useState(sharedWorkspace?.mode === 'review');
   const [compareSql, setCompareSql] = useState('');
   const [compareExplainInput, setCompareExplainInput] = useState('');
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
@@ -3006,6 +737,7 @@ function App() {
   const sqlInputRef = useRef<HTMLTextAreaElement | null>(null);
   const graphShellRef = useRef<HTMLDivElement | null>(null);
   const graphViewportRef = useRef<HTMLDivElement | null>(null);
+  const skipInitialWorkspaceRestoreRef = useRef(Boolean(sharedWorkspace));
   const deferredSearchQuery = useDeferredValue(searchQuery);
   const deferredCompareSql = useDeferredValue(compareSql);
   const deferredCompareExplainInput = useDeferredValue(compareExplainInput);
@@ -3098,6 +830,10 @@ function App() {
   const fanoutState = useMemo(
     () => buildFanoutState(analysis.joins, joinInsights),
     [analysis.joins, joinInsights],
+  );
+  const reviewCommentEntries = useMemo(
+    () => Object.entries(entityNotes).filter((entry) => entry[1].trim().length > 0),
+    [entityNotes],
   );
   const lineageColumns = useMemo(
     () => buildColumnLineage(analysis.columns, analysis.joins, analysis.tables[0]?.alias ?? ''),
@@ -3241,6 +977,14 @@ function App() {
         : null,
     [analysis, compareAnalysis, compareExplainSummary, explainSummary],
   );
+  const reviewGuidance = useMemo(
+    () => buildRewriteGuidance(analysis, joinInsights, explainSummary, activeDialect),
+    [activeDialect, analysis, explainSummary, joinInsights],
+  );
+  const selectedJoinGuidance = useMemo(
+    () => (selectedJoin ? reviewGuidance.filter((item) => item.relatedJoinId === selectedJoin.id) : []),
+    [reviewGuidance, selectedJoin],
+  );
   const compareLayout = useMemo(
     () => (compareAnalysis ? createNodeLayout(compareAnalysis.tables, compareAnalysis.joins, layoutMode) : null),
     [compareAnalysis, layoutMode],
@@ -3344,251 +1088,38 @@ function App() {
     }),
     [compareLayout?.height, compareLayout?.width, layout.height, layout.width],
   );
-  const reviewReport = useMemo(() => {
-    const noteEntries = Object.entries(entityNotes).filter((entry) => entry[1].trim().length > 0);
-    const lines: string[] = [
-      '# Queryviz Review Report',
-      '',
-      `- Statement: #${analysis.analyzedStatementIndex + 1}`,
-      `- Statement type: ${formatStatementTypeLabel(analysis.statementType)}`,
-      `- Dialect: ${dialectLabel[activeDialect]}`,
-      `- Layout: ${layoutModeLabel[layoutMode]}`,
-      `- Complexity score: ${analysis.complexityScore}`,
-      `- Tables: ${analysis.tables.length}`,
-      `- Joins: ${analysis.joins.length}`,
-      `- Filters: ${analysis.filters.length}`,
-      `- Fanout paths: ${fanoutState.impactedAliases.size}`,
-    ];
-
-    if (parsedSchema.summary.tableCount > 0) {
-      lines.push(`- Imported schema tables: ${parsedSchema.summary.tableCount}`);
-      lines.push(`- Verified joins: ${verifiedJoinCount}`);
-    }
-
-    if (analysis.writeTarget) {
-      lines.push(`- Write target: ${analysis.writeTarget}`);
-    }
-
-    if (analysis.derivedRelations.length > 0) {
-      lines.push(`- Derived relations: ${analysis.derivedRelations.length}`);
-    }
-
-    if (explainSummary.items.length > 0) {
-      lines.push(`- Plan overlay: ${formatPlural(explainSummary.items.length, 'signal')}`);
-      if (explainSummary.summary.estimateWarnings > 0) {
-        lines.push(`- Plan misestimates: ${explainSummary.summary.estimateWarnings}`);
-      }
-    }
-
-    lines.push('', '## Joins', '');
-
-    if (analysis.joins.length > 0) {
-      lines.push('| Source | Join | Target | ON | Cardinality | Guidance |');
-      lines.push('| --- | --- | --- | --- | --- | --- |');
-
-      analysis.joins.forEach((join) => {
-        const insight = joinInsights[join.id];
-        lines.push(
-          `| ${escapeMarkdownCell(join.sourceAlias)} | ${escapeMarkdownCell(insight?.joinLabel ?? formatJoinTypeLabel(join.type))} | ${escapeMarkdownCell(join.targetAlias)} | ${escapeMarkdownCell(insight?.fullConditionLabel ?? join.condition)} | ${escapeMarkdownCell(`${insight?.badgeLabel ?? 'M:N'} (${insight?.confidenceLabel ?? 'Heuristic'})`)} | ${escapeMarkdownCell(insight?.summary ?? '')} |`,
-        );
-      });
-    } else {
-      lines.push('No joins detected.');
-    }
-
-    lines.push('', '## Flags', '');
-
-    if (analysis.flags.length > 0) {
-      analysis.flags.forEach((flag) => {
-        const content = getFlagContent(flag.title, flag.description);
-        lines.push(`- [${severityLabel[flag.severity]}] ${content.title} — ${content.description}`);
-      });
-    } else {
-      lines.push('- No major warnings.');
-    }
-
-    if (analysis.derivedRelations.length > 0) {
-      lines.push('', '## Derived Relations', '');
-      analysis.derivedRelations.forEach((relation) => {
-        lines.push(`### ${relation.kind.toUpperCase()}: ${relation.alias}`);
-        lines.push(`- Sources: ${relation.sourceCount}`);
-        lines.push(`- Joins: ${relation.joinCount}`);
-        lines.push(`- Subqueries: ${relation.subqueryCount}`);
-        lines.push(`- Aggregation: ${relation.hasAggregation ? 'Yes' : 'No'}`);
-        if (relation.dependencies.length > 0) {
-          lines.push(`- Dependencies: ${relation.dependencies.join(', ')}`);
-        }
-        if (relation.flags.length > 0) {
-          lines.push(`- Flags: ${relation.flags.join(', ')}`);
-        }
-        lines.push('');
-      });
-    }
-
-    if (explainSummary.items.length > 0) {
-      lines.push('## Plan Overlay', '');
-      lines.push(`- Seq scans: ${explainSummary.summary.seqScans}`);
-      lines.push(`- Indexed reads: ${explainSummary.summary.indexedReads}`);
-      lines.push(`- Join nodes: ${explainSummary.summary.joinNodes}`);
-      lines.push(`- Sorts: ${explainSummary.summary.sorts}`);
-      lines.push(`- Mapped joins: ${explainSummary.summary.mappedJoins}`);
-      if (explainSummary.summary.maxCost > 0) {
-        lines.push(`- Max cost: ${formatCompactNumber(explainSummary.summary.maxCost)}`);
-      }
-      if (explainSummary.summary.maxRows > 0) {
-        lines.push(`- Max rows: ${formatCompactNumber(explainSummary.summary.maxRows)}`);
-      }
-      if (explainSummary.summary.estimateWarnings > 0) {
-        lines.push(`- Misestimates: ${explainSummary.summary.estimateWarnings}`);
-      }
-      lines.push('');
-      explainSummary.items.slice(0, 12).forEach((signal) => {
-        const metrics = formatPlanMetrics(signal, 'full');
-        lines.push(`- ${signal.title}${metrics ? ` (${metrics})` : ''} — ${signal.detail}`);
-      });
-    }
-
-    if (noteEntries.length > 0) {
-      lines.push('', '## Notes', '');
-
-      noteEntries.forEach(([entityKey, note]) => {
-        const [kind, value] = entityKey.split(':');
-        const join = kind === 'join' ? analysis.joins.find((item) => item.id === value) : null;
-        const table = kind === 'node' ? analysis.tables.find((item) => item.alias === value) : null;
-        const label =
-          join
-            ? `Join ${join.sourceAlias} -> ${join.targetAlias}`
-            : table
-              ? `Node ${table.alias} (${table.name})`
-              : entityKey;
-
-        lines.push(`- ${escapeMarkdownCell(label)} — ${escapeMarkdownCell(normalizeSpaces(note))}`);
-      });
-    }
-
-    if (compareSummary && compareAnalysis) {
-      lines.push('', '## Compare Mode', '');
-      lines.push(`- Baseline statement: #${compareAnalysis.analyzedStatementIndex + 1}`);
-      lines.push(`- Complexity delta: ${formatSignedDelta(compareSummary.complexityDelta)}`);
-      lines.push(`- Table delta: ${formatSignedDelta(compareSummary.tableDelta)}`);
-      lines.push(`- Join delta: ${formatSignedDelta(compareSummary.joinDelta)}`);
-      lines.push(`- Flag delta: ${formatSignedDelta(compareSummary.flagDelta)}`);
-
-      if (compareSummary.hasPlanComparison) {
-        lines.push(`- Plan signal delta: ${formatSignedDelta(compareSummary.planSignalDelta)}`);
-        lines.push(`- Seq scan delta: ${formatSignedDelta(compareSummary.seqScanDelta)}`);
-        lines.push(`- Join node delta: ${formatSignedDelta(compareSummary.joinNodeDelta)}`);
-        if (compareSummary.maxCostDelta !== null) {
-          lines.push(`- Max cost delta: ${formatSignedDelta(Number(compareSummary.maxCostDelta.toFixed(2)))}`);
-        }
-        if (compareSummary.maxRowsDelta !== null) {
-          lines.push(`- Max rows delta: ${formatSignedDelta(compareSummary.maxRowsDelta)}`);
-        }
-      }
-
-      if (compareSummary.addedJoins.length > 0) {
-        lines.push('', '### Added joins');
-        compareSummary.addedJoins.slice(0, 8).forEach((item) => lines.push(`- ${escapeMarkdownCell(item)}`));
-      }
-
-      if (compareSummary.removedJoins.length > 0) {
-        lines.push('', '### Removed joins');
-        compareSummary.removedJoins.slice(0, 8).forEach((item) => lines.push(`- ${escapeMarkdownCell(item)}`));
-      }
-
-      if (compareSummary.addedFlags.length > 0 || compareSummary.removedFlags.length > 0) {
-        lines.push('', '### Flag changes');
-        compareSummary.addedFlags.forEach((item) => lines.push(`- Added flag: ${escapeMarkdownCell(item)}`));
-        compareSummary.removedFlags.forEach((item) => lines.push(`- Removed flag: ${escapeMarkdownCell(item)}`));
-      }
-    }
-
-    return lines.join('\n');
-  }, [activeDialect, analysis, compareAnalysis, compareSummary, entityNotes, explainSummary, fanoutState.impactedAliases.size, joinInsights, layoutMode, parsedSchema.summary.tableCount, verifiedJoinCount]);
-  const executionReport = useMemo(() => {
-    const lines: string[] = [
-      '# Queryviz Execution Report',
-      '',
-      `- Statement: #${analysis.analyzedStatementIndex + 1}`,
-      `- Statement type: ${formatStatementTypeLabel(analysis.statementType)}`,
-      `- Dialect: ${dialectLabel[activeDialect]}`,
-      `- Complexity score: ${analysis.complexityScore}`,
-      `- Tables: ${analysis.tables.length}`,
-      `- Joins: ${analysis.joins.length}`,
-    ];
-
-    if (parsedSchema.summary.tableCount > 0) {
-      lines.push(`- Imported schema tables: ${parsedSchema.summary.tableCount}`);
-      lines.push(`- Verified joins: ${verifiedJoinCount}`);
-    }
-
-    if (analysis.writeTarget) {
-      lines.push(`- Write target: ${analysis.writeTarget}`);
-    }
-
-    if (analysis.flags.length > 0) {
-      lines.push(`- Flags: ${analysis.flags.length}`);
-    }
-
-    lines.push('', '## Plan Summary', '');
-
-    if (explainSummary.items.length === 0) {
-      lines.push('- No EXPLAIN data pasted yet.');
-    } else {
-      lines.push(`- Seq scans: ${explainSummary.summary.seqScans}`);
-      lines.push(`- Indexed reads: ${explainSummary.summary.indexedReads}`);
-      lines.push(`- Join nodes: ${explainSummary.summary.joinNodes}`);
-      lines.push(`- Sorts: ${explainSummary.summary.sorts}`);
-      lines.push(`- Mapped joins: ${explainSummary.summary.mappedJoins}`);
-      if (explainSummary.summary.maxCost > 0) {
-        lines.push(`- Max cost: ${formatCompactNumber(explainSummary.summary.maxCost)}`);
-      }
-      if (explainSummary.summary.maxRows > 0) {
-        lines.push(`- Max estimated rows: ${formatCompactNumber(explainSummary.summary.maxRows)}`);
-      }
-      if (explainSummary.summary.estimateWarnings > 0) {
-        lines.push(`- Misestimates: ${explainSummary.summary.estimateWarnings}`);
-      }
-    }
-
-    lines.push('', '## Join Focus', '');
-
-    if (analysis.joins.length === 0) {
-      lines.push('- No joins detected.');
-    } else {
-      analysis.joins.forEach((join) => {
-        const insight = joinInsights[join.id];
-        const signal = getStrongestExplainSignal(explainSummary.joinSignals[join.id]);
-        const metrics = signal ? formatPlanMetrics(signal, 'full') : '';
-        lines.push(
-          `- ${insight?.joinLabel ?? formatJoinTypeLabel(join.type)} ${join.sourceAlias} -> ${join.targetAlias} | ${insight?.badgeLabel ?? 'M:N'} | ${insight?.confidenceLabel ?? 'Heuristic'} | ${
-            insight?.fullConditionLabel ?? join.condition
-          }${signal ? ` | ${signal.title}${metrics ? ` (${metrics})` : ''}` : ''}`,
-        );
-      });
-    }
-
-    lines.push('', '## Relation Signals', '');
-
-    if (explainSummary.items.length === 0) {
-      lines.push('- Paste EXPLAIN / EXPLAIN ANALYZE output to populate engine signals.');
-    } else {
-      explainSummary.items.slice(0, 15).forEach((signal) => {
-        const metrics = formatPlanMetrics(signal, 'full');
-        lines.push(`- ${signal.title}${metrics ? ` (${metrics})` : ''} — ${signal.detail}`);
-      });
-    }
-
-    if (analysis.flags.length > 0) {
-      lines.push('', '## Flags', '');
-      analysis.flags.forEach((flag) => {
-        const content = getFlagContent(flag.title, flag.description);
-        lines.push(`- [${severityLabel[flag.severity]}] ${content.title} — ${content.description}`);
-      });
-    }
-
-    return lines.join('\n');
-  }, [activeDialect, analysis, explainSummary, joinInsights, parsedSchema.summary.tableCount, verifiedJoinCount]);
+  const reviewReport = useMemo(
+    () =>
+      buildReviewReport({
+        activeDialect,
+        analysis,
+        compareAnalysis,
+        compareSummary,
+        entityNotes,
+        explainSummary,
+        fanoutPathCount: fanoutState.impactedAliases.size,
+        joinInsights,
+        layoutMode,
+        parsedSchema,
+        reviewGuidance,
+        reviewStatus,
+        reviewSummary,
+        verifiedJoinCount,
+      }),
+    [activeDialect, analysis, compareAnalysis, compareSummary, entityNotes, explainSummary, fanoutState.impactedAliases.size, joinInsights, layoutMode, parsedSchema, reviewGuidance, reviewStatus, reviewSummary, verifiedJoinCount],
+  );
+  const executionReport = useMemo(
+    () =>
+      buildExecutionReport({
+        activeDialect,
+        analysis,
+        explainSummary,
+        joinInsights,
+        parsedSchema,
+        verifiedJoinCount,
+      }),
+    [activeDialect, analysis, explainSummary, joinInsights, parsedSchema, verifiedJoinCount],
+  );
 
   useEffect(() => {
     const element = graphShellRef.current;
@@ -3642,6 +1173,11 @@ function App() {
   }, [savedQueries]);
 
   useLayoutEffect(() => {
+    if (skipInitialWorkspaceRestoreRef.current) {
+      skipInitialWorkspaceRestoreRef.current = false;
+      return;
+    }
+
     const savedState = readWorkspaceViewState(workspaceStateKey);
     if (!savedState) {
       return;
@@ -3650,6 +1186,8 @@ function App() {
     /* eslint-disable react-hooks/set-state-in-effect */
     setDialect(savedState.dialect);
     setSchemaSql(savedState.schemaSql);
+    setReviewStatus(savedState.reviewStatus);
+    setReviewSummary(savedState.reviewSummary);
     setLayoutMode(savedState.layoutMode);
     setExpandedDerivedIds(savedState.expandedDerivedIds);
     setNodeOffsets(savedState.nodeOffsets);
@@ -3669,6 +1207,8 @@ function App() {
     saveWorkspaceViewState(workspaceStateKey, {
       dialect: activeDialect,
       schemaSql,
+      reviewStatus,
+      reviewSummary,
       layoutMode,
       expandedDerivedIds,
       nodeOffsets,
@@ -3687,6 +1227,8 @@ function App() {
     layoutMode,
     nodeOffsets,
     pan,
+    reviewStatus,
+    reviewSummary,
     schemaSql,
     workspaceStateKey,
     zoom,
@@ -3760,6 +1302,10 @@ function App() {
     setSql(nextSql);
     setSelectedStatementIndex(nextStatementIndex);
     setDialect(nextDialect ?? detectSqlDialect(nextSql, dialect).dialect);
+    setSchemaSql('');
+    setIsReadOnlyReview(false);
+    setReviewStatus('draft');
+    setReviewSummary('');
     setSelectedAlias(null);
     setSelectedJoinId(null);
     setSelectedLineageId(null);
@@ -3973,18 +1519,7 @@ function App() {
     };
 
     setSavedQueries((current) => {
-      const existing = current.find((item) => item.sql === sql);
-      const nextList = existing
-        ? current.map((item) =>
-            item.id === existing.id
-              ? { ...item, title: nextEntry.title, updatedAt: nextEntry.updatedAt, selectedStatementIndex: nextEntry.selectedStatementIndex, dialect: nextEntry.dialect }
-              : item,
-          )
-        : [nextEntry, ...current];
-
-      return nextList
-        .sort((left, right) => right.updatedAt - left.updatedAt)
-        .slice(0, MAX_SAVED_QUERIES);
+      return upsertSavedQuery(current, nextEntry);
     });
     setStatusMessage('Saved locally.');
   };
@@ -4131,6 +1666,38 @@ function App() {
     }
   };
 
+  const handleCopyReviewLink = async () => {
+    if (!analysis.normalizedSql.trim()) {
+      return;
+    }
+
+    const shareUrl = createReviewShareUrl({
+      sql,
+      selectedStatementIndex: safeSelectedStatementIndex,
+      dialect: activeDialect,
+      schemaSql,
+      mode: 'review',
+      reviewStatus,
+      reviewSummary,
+      entityNotes,
+    });
+
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setStatusMessage('Review link copied.');
+    } catch {
+      window.prompt('Copy this review link:', shareUrl);
+    }
+  };
+
+  const handleExitReadOnlyReview = () => {
+    if (typeof window !== 'undefined') {
+      window.location.hash = createShareUrl(sql, safeSelectedStatementIndex, activeDialect).split('#')[1] ?? '';
+    }
+    setIsReadOnlyReview(false);
+    setStatusMessage('Switched to editable workspace.');
+  };
+
   const handleGlobalKeyDown = useEffectEvent((event: KeyboardEvent) => {
     const target = event.target as HTMLElement | null;
     const isEditing =
@@ -4196,6 +1763,15 @@ function App() {
             <span>SQL input</span>
             <strong>{sql.length} chars · {dialectLabel[activeDialect]} · Auto</strong>
           </div>
+          {isReadOnlyReview ? (
+            <div className="review-banner">
+              <strong>Read-only review page</strong>
+              <span>This link opened Queryviz in review mode. You can inspect the graph, comments, and guidance, but edits are locked.</span>
+              <button type="button" onClick={handleExitReadOnlyReview}>
+                Open editable workspace
+              </button>
+            </div>
+          ) : null}
           <div className="dialect-meta" aria-live="polite">
             <strong>Detected {dialectLabel[activeDialect]}</strong>
             <small>
@@ -4220,6 +1796,7 @@ function App() {
               value={sql}
               onChange={handleSqlChange}
               onScroll={(event) => setSqlScrollTop(event.currentTarget.scrollTop)}
+              readOnly={isReadOnlyReview}
               spellCheck={false}
               placeholder="Paste a SELECT query here..."
             />
@@ -4231,20 +1808,24 @@ function App() {
                 loadWorkspace(getDialectSampleSql(activeDialect), 0, activeDialect);
                 setStatusMessage(`Loaded ${dialectLabel[activeDialect]} sample.`);
               }}
+              disabled={isReadOnlyReview}
             >
               Load sample
             </button>
-            <button type="button" onClick={() => fileInputRef.current?.click()}>
+            <button type="button" onClick={() => fileInputRef.current?.click()} disabled={isReadOnlyReview}>
               Open .sql
             </button>
-            <button type="button" onClick={() => loadWorkspace('')}>
+            <button type="button" onClick={() => loadWorkspace('')} disabled={isReadOnlyReview}>
               Clear
             </button>
-            <button type="button" onClick={handleSaveQuery} disabled={!analysis.normalizedSql.trim()}>
+            <button type="button" onClick={handleSaveQuery} disabled={isReadOnlyReview || !analysis.normalizedSql.trim()}>
               Save query
             </button>
             <button type="button" onClick={() => void handleCopyShareLink()} disabled={!analysis.normalizedSql.trim()}>
               Copy share link
+            </button>
+            <button type="button" onClick={() => void handleCopyReviewLink()} disabled={!analysis.normalizedSql.trim()}>
+              Copy review link
             </button>
             <button type="button" onClick={() => void handleCopyReviewReport()} disabled={!analysis.normalizedSql.trim()}>
               Copy review report
@@ -4266,14 +1847,19 @@ function App() {
         <section className="statement-panel">
           <div className="panel-head">
             <span>Schema import</span>
-            <strong>{parsedSchema.summary.tableCount > 0 ? `${parsedSchema.summary.tableCount} tables` : 'Optional'}</strong>
+            <strong>
+              {parsedSchema.summary.tableCount > 0
+                ? `${parsedSchema.summary.tableCount} tables · ${schemaSourceLabel[parsedSchema.sourceKind]}`
+                : 'Optional'}
+            </strong>
           </div>
           <textarea
             className="plan-input schema-input"
             value={schemaSql}
             onChange={handleSchemaChange}
+            readOnly={isReadOnlyReview}
             spellCheck={false}
-            placeholder="Paste CREATE TABLE / CREATE INDEX DDL here to verify PK/FK joins and index coverage."
+            placeholder="Paste CREATE TABLE / CREATE INDEX DDL, a dbt manifest JSON, or dbt schema.yml metadata here."
           />
           <div className="editor-actions editor-actions--compact">
             <button
@@ -4282,11 +1868,12 @@ function App() {
                 setSchemaSql(SAMPLE_SCHEMA_SQL);
                 setStatusMessage('Sample schema loaded.');
               }}
+              disabled={isReadOnlyReview}
             >
               Load sample schema
             </button>
-            <button type="button" onClick={() => schemaFileInputRef.current?.click()}>
-              Open DDL
+            <button type="button" onClick={() => schemaFileInputRef.current?.click()} disabled={isReadOnlyReview}>
+              Open metadata
             </button>
             <button
               type="button"
@@ -4294,7 +1881,7 @@ function App() {
                 setSchemaSql('');
                 setStatusMessage('Schema cleared.');
               }}
-              disabled={!schemaSql.trim()}
+              disabled={isReadOnlyReview || !schemaSql.trim()}
             >
               Clear schema
             </button>
@@ -4303,7 +1890,7 @@ function App() {
             ref={schemaFileInputRef}
             className="hidden-file-input"
             type="file"
-            accept=".sql,.ddl,.txt"
+            accept=".sql,.ddl,.txt,.json,.yml,.yaml"
             onChange={handleSchemaFileChange}
           />
           {schemaSql.trim() ? (
@@ -4318,11 +1905,11 @@ function App() {
                   </span>
                 </div>
                 <p className="editor-note">
-                  Matching joins will switch from <strong>Heuristic</strong> to <strong>Verified</strong> when the imported schema confirms FK or key coverage.
+                  Matching joins will switch from <strong>Heuristic</strong> to <strong>Verified</strong> when imported DDL or dbt metadata confirms FK or key coverage.
                 </p>
               </>
             ) : (
-              <p className="editor-note">No `CREATE TABLE` or `CREATE INDEX` statements were recognized yet. Paste a little more DDL.</p>
+              <p className="editor-note">No DDL or dbt metadata was recognized yet. Paste a little more schema context.</p>
             )
           ) : (
             <p className="editor-note">Keep this local and optional. Queryviz uses it only to improve confidence on joins and index hints.</p>
@@ -4425,6 +2012,7 @@ function App() {
             className="plan-input"
             value={explainInput}
             onChange={(event) => setExplainInput(event.target.value)}
+            readOnly={isReadOnlyReview}
             spellCheck={false}
             placeholder={planPlaceholder}
           />
@@ -4439,6 +2027,11 @@ function App() {
                   Mapped joins: {explainSummary.summary.mappedJoins}
                   {analysis.joins.length > 0 ? ` / ${analysis.joins.length}` : ''}
                 </span>
+                {explainSummary.summary.unmappedJoinNodes > 0 ? (
+                  <span className="plan-summary__chip plan-summary__chip--warning">
+                    Unmapped join nodes: {explainSummary.summary.unmappedJoinNodes}
+                  </span>
+                ) : null}
                 {explainSummary.summary.maxCost > 0 ? (
                   <span className="plan-summary__chip">Max cost: {formatCompactNumber(explainSummary.summary.maxCost)}</span>
                 ) : null}
@@ -4457,7 +2050,7 @@ function App() {
               </div>
               {analysis.joins.length > 0 && explainSummary.summary.mappedJoins < analysis.joins.length ? (
                 <p className="editor-note">
-                  Some joins are still unmatched. Paste a fuller plan or engine-native JSON/XML output for better edge mapping.
+                  Some joins are still unmatched. Paste a fuller plan or engine-native JSON/XML output for better edge mapping. Unmapped join nodes are counted separately above.
                 </p>
               ) : null}
               <div className="plan-signal-list">
@@ -5223,6 +2816,17 @@ function App() {
                       )}
                     </p>
 
+                    {selectedJoinInsight.verificationDetails.length > 0 ? (
+                      <section className="inspector-section">
+                        <span className="canvas-toolbar__label">Verification</span>
+                        <ul className="inspector-list">
+                          {selectedJoinInsight.verificationDetails.map((detail) => (
+                            <li key={detail}>{detail}</li>
+                          ))}
+                        </ul>
+                      </section>
+                    ) : null}
+
                     <section className="inspector-section">
                       <span className="canvas-toolbar__label">ON condition</span>
                       <code className="inspector-code">{selectedJoinInsight.fullConditionLabel}</code>
@@ -5257,6 +2861,21 @@ function App() {
                       <p className="inspector-summary">{selectedJoinInsight.fanoutSummary}</p>
                     </section>
 
+                    {selectedJoinGuidance.length > 0 ? (
+                      <section className="inspector-section">
+                        <span className="canvas-toolbar__label">Rewrite guidance</span>
+                        <div className="guidance-list">
+                          {selectedJoinGuidance.slice(0, 3).map((item) => (
+                            <article key={item.id} className={`guidance-card guidance-card--${item.priority}`}>
+                              <strong>{item.title}</strong>
+                              <p>{item.summary}</p>
+                              <small>{item.action}</small>
+                            </article>
+                          ))}
+                        </div>
+                      </section>
+                    ) : null}
+
                     <section className="inspector-section">
                       <span className="canvas-toolbar__label">Plan signals</span>
                       {selectedJoinSignals.length > 0 ? (
@@ -5270,6 +2889,7 @@ function App() {
                                   {getEstimateBadgeLabel(signal.estimateFactor)}
                                 </span>
                               ) : null}
+                              {formatExplainMapping(signal) ? <small>{formatExplainMapping(signal)}</small> : null}
                               <span>{signal.detail}</span>
                             </article>
                           ))}
@@ -5287,15 +2907,16 @@ function App() {
                     </section>
 
                     <section className="inspector-section">
-                      <span className="canvas-toolbar__label">Notes</span>
+                      <span className="canvas-toolbar__label">Review comments</span>
                       <textarea
                         className="note-input"
                         value={entityNotes[getJoinNoteKey(selectedJoin.id)] ?? ''}
                         onChange={(event) => handleEntityNoteChange(getJoinNoteKey(selectedJoin.id), event.target.value)}
+                        readOnly={isReadOnlyReview}
                         spellCheck={false}
-                        placeholder="Add a note about this join, fanout risk, or follow-up."
+                        placeholder="Add a comment about this join, fanout risk, or follow-up."
                       />
-                      <small className="inspector-note">Notes are saved locally per query workspace.</small>
+                      <small className="inspector-note">Comments are saved locally per query workspace and can be included in review links.</small>
                     </section>
                   </div>
                 ) : selectedTable ? (
@@ -5369,6 +2990,7 @@ function App() {
                                   {getEstimateBadgeLabel(signal.estimateFactor)}
                                 </span>
                               ) : null}
+                              {formatExplainMapping(signal) ? <small>{formatExplainMapping(signal)}</small> : null}
                               <span>{signal.detail}</span>
                             </article>
                           ))}
@@ -5393,15 +3015,16 @@ function App() {
                     ) : null}
 
                     <section className="inspector-section">
-                      <span className="canvas-toolbar__label">Notes</span>
+                      <span className="canvas-toolbar__label">Review comments</span>
                       <textarea
                         className="note-input"
                         value={entityNotes[getNodeNoteKey(selectedTable.alias)] ?? ''}
                         onChange={(event) => handleEntityNoteChange(getNodeNoteKey(selectedTable.alias), event.target.value)}
+                        readOnly={isReadOnlyReview}
                         spellCheck={false}
-                        placeholder="Add a note about this table, CTE, or subquery."
+                        placeholder="Add a comment about this table, CTE, or subquery."
                       />
-                      <small className="inspector-note">Notes are saved locally per query workspace.</small>
+                      <small className="inspector-note">Comments are saved locally per query workspace and can be included in review links.</small>
                     </section>
                   </div>
                 ) : selectedLineage ? (
@@ -5486,6 +3109,8 @@ function App() {
                 <strong>
                   {detailTab === 'joins'
                     ? analysis.joins.length
+                    : detailTab === 'review'
+                      ? reviewGuidance.length + reviewCommentEntries.length + (reviewSummary.trim() ? 1 : 0)
                     : detailTab === 'lineage'
                       ? lineageColumns.length
                       : analysis.clauses.filter((clause) => clause.present).length}
@@ -5513,8 +3138,15 @@ function App() {
                 >
                   Lineage
                 </button>
+                <button
+                  type="button"
+                  className={detailTab === 'review' ? 'is-active' : ''}
+                  onClick={() => setDetailTab('review')}
+                >
+                  Review
+                </button>
               </div>
-              <div className={`bottom-card__content ${detailTab === 'joins' || detailTab === 'lineage' ? 'mono-list' : 'clause-list compact'}`}>
+              <div className={`bottom-card__content ${detailTab === 'joins' || detailTab === 'lineage' ? 'mono-list' : detailTab === 'clauses' ? 'clause-list compact' : ''}`}>
                 {detailTab === 'joins' ? (
                   analysis.joins.length > 0 ? (
                     <>
@@ -5578,6 +3210,127 @@ function App() {
                   ) : (
                     <div>No projected columns detected.</div>
                   )
+                ) : detailTab === 'review' ? (
+                  <div className="review-panel">
+                    {isReadOnlyReview ? (
+                      <p className="rail-note">
+                        This review link is read-only. You can inspect comments, verification details, and rewrite guidance, but any edits stay locked.
+                      </p>
+                    ) : null}
+                    <section className="review-section">
+                      <span className="canvas-toolbar__label">Review status</span>
+                      <div className="review-statuses">
+                        {(['draft', 'needs_changes', 'approved'] as const).map((status) => (
+                          <button
+                            key={status}
+                            type="button"
+                            className={`review-status review-status--${reviewStatusTone[status]}${reviewStatus === status ? ' is-active' : ''}`}
+                            onClick={() => setReviewStatus(status)}
+                            disabled={isReadOnlyReview}
+                          >
+                            {reviewStatusLabel[status]}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="rail-note">Use review mode to leave a quick verdict, capture follow-up, and share the exact workspace state with teammates.</p>
+                    </section>
+
+                    <section className="review-section">
+                      <div className="panel-head">
+                        <span>Summary</span>
+                        <strong>{reviewCommentEntries.length} comments</strong>
+                      </div>
+                      <textarea
+                        className="note-input note-input--summary"
+                        value={reviewSummary}
+                        onChange={(event) => setReviewSummary(event.target.value)}
+                        readOnly={isReadOnlyReview}
+                        spellCheck={false}
+                        placeholder="Summarize the main review outcome, risk, or next step."
+                      />
+                      <div className="editor-actions editor-actions--compact">
+                        <button type="button" onClick={() => void handleCopyReviewReport()} disabled={!analysis.normalizedSql.trim()}>
+                          Copy review report
+                        </button>
+                        <button type="button" onClick={() => void handleCopyReviewLink()} disabled={!analysis.normalizedSql.trim()}>
+                          Copy review link
+                        </button>
+                      </div>
+                    </section>
+
+                    <section className="review-section">
+                      <div className="panel-head">
+                        <span>Rewrite guidance</span>
+                        <strong>{reviewGuidance.length}</strong>
+                      </div>
+                      {reviewGuidance.length > 0 ? (
+                        <div className="guidance-list">
+                          {reviewGuidance.map((item) => (
+                            <article key={item.id} className={`guidance-card guidance-card--${item.priority}`}>
+                              <div className="guidance-card__head">
+                                <strong>{item.title}</strong>
+                                <span>{item.priority.toUpperCase()} · {item.confidence === 'structural' ? 'Structural' : item.confidence === 'verified' ? 'Verified' : 'Heuristic'}</span>
+                              </div>
+                              <p>{item.summary}</p>
+                              <small>{item.action}</small>
+                            </article>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="inspector-empty">No extra rewrite guidance yet. Paste EXPLAIN, import schema, or inspect flags to surface more specific fixes.</p>
+                      )}
+                    </section>
+
+                    <section className="review-section">
+                      <div className="panel-head">
+                        <span>Flag comments</span>
+                        <strong>{analysis.flags.length}</strong>
+                      </div>
+                      {analysis.flags.length > 0 ? (
+                        <div className="flag-review-list">
+                          {analysis.flags.map((flag) => {
+                            const content = getFlagContent(flag.title, flag.description);
+                            return (
+                              <article key={content.title} className={`flag flag--${flag.severity}`}>
+                                <div className="flag__head">
+                                  <strong>{content.title}</strong>
+                                  <span className="flag__severity">{severityLabel[flag.severity]}</span>
+                                </div>
+                                <p className="flag__description">{content.description}</p>
+                                <textarea
+                                  className="note-input note-input--compact"
+                                  value={entityNotes[getFlagNoteKey(content.title)] ?? ''}
+                                  onChange={(event) => handleEntityNoteChange(getFlagNoteKey(content.title), event.target.value)}
+                                  readOnly={isReadOnlyReview}
+                                  spellCheck={false}
+                                  placeholder="Leave a review comment or follow-up for this flag."
+                                />
+                              </article>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <p className="inspector-empty">No flags on this statement. You can still leave summary comments above if you reviewed it manually.</p>
+                      )}
+                    </section>
+
+                    {reviewCommentEntries.length > 0 ? (
+                      <section className="review-section">
+                        <div className="panel-head">
+                          <span>Comments in workspace</span>
+                          <strong>{reviewCommentEntries.length}</strong>
+                        </div>
+                        <div className="comment-list">
+                          {reviewCommentEntries.map(([entityKey, note]) => (
+                            <article key={entityKey} className="comment-card">
+                              <strong>{formatEntityNoteLabel(entityKey, analysis)}</strong>
+                              <p>{normalizeSpaces(note)}</p>
+                            </article>
+                          ))}
+                        </div>
+                      </section>
+                    ) : null}
+                  </div>
                 ) : (
                   analysis.clauses.map((clause) => (
                     <div key={clause.label} className={`clause-chip ${clause.present ? 'is-on' : 'is-off'}`}>

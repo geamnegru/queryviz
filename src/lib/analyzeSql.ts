@@ -1,4 +1,19 @@
-export type Severity = 'high' | 'medium' | 'low';
+import type {
+  ClauseRanges,
+  ClauseStatus,
+  ColumnRef,
+  DerivedRelation,
+  JoinRef,
+  QueryFlag,
+  SqlAnalysis,
+  SqlDiagnostic,
+  SqlDiagnosticSeverity,
+  SqlDialect,
+  SqlDialectDetection,
+  StatementEnvelope,
+  TableRef,
+} from './types';
+
 export const SUPPORTED_SQL_DIALECTS = [
   'postgres',
   'mysql',
@@ -11,117 +26,7 @@ export const SUPPORTED_SQL_DIALECTS = [
   'duckdb',
   'redshift',
   'trino',
-] as const;
-
-export type SqlDialect = (typeof SUPPORTED_SQL_DIALECTS)[number];
-
-export interface ColumnRef {
-  expression: string;
-  alias?: string;
-}
-
-export interface TableRef {
-  id: string;
-  name: string;
-  alias: string;
-  role: 'source' | 'join' | 'target';
-  kind?: 'table' | 'cte' | 'subquery';
-  derivedId?: string;
-  specialType?: 'unnest' | 'flatten' | 'function' | 'external' | 'temp';
-}
-
-export interface JoinRef {
-  id: string;
-  type: string;
-  tableName: string;
-  alias: string;
-  condition: string;
-  sourceAlias: string;
-  targetAlias: string;
-}
-
-export interface QueryFlag {
-  severity: Severity;
-  title: string;
-  description: string;
-}
-
-export interface ClauseStatus {
-  label: string;
-  present: boolean;
-  detail: string;
-}
-
-export interface DerivedRelation {
-  id: string;
-  name: string;
-  alias: string;
-  kind: 'cte' | 'subquery';
-  body: string;
-  sourceCount: number;
-  joinCount: number;
-  subqueryCount: number;
-  hasAggregation: boolean;
-  dependencies: string[];
-  flags: string[];
-}
-
-export type SqlDiagnosticSeverity = 'error' | 'warning';
-
-export interface SqlDiagnostic {
-  severity: SqlDiagnosticSeverity;
-  title: string;
-  message: string;
-  hint: string;
-  line: number;
-  column: number;
-  index: number;
-  excerpt: string;
-}
-
-export interface SqlAnalysis {
-  statementCount: number;
-  analyzedStatementIndex: number;
-  analyzedStatement: string;
-  normalizedSql: string;
-  statementType: 'select' | 'insert-select' | 'create-view' | 'create-table-as' | 'update-from' | 'merge' | 'unknown';
-  statementLabel: string;
-  writeTarget?: string;
-  columns: ColumnRef[];
-  tables: TableRef[];
-  joins: JoinRef[];
-  filters: string[];
-  groupBy: string[];
-  orderBy: string[];
-  limit?: string;
-  clauses: ClauseStatus[];
-  flags: QueryFlag[];
-  derivedRelations: DerivedRelation[];
-  subqueryCount: number;
-  hasAggregation: boolean;
-  complexityScore: number;
-}
-
-export interface SqlDialectDetection {
-  dialect: SqlDialect;
-  confident: boolean;
-  evidence: string[];
-  score: number;
-}
-
-interface ClauseRanges {
-  selectIndex: number;
-  fromIndex: number;
-  whereIndex: number;
-  groupByIndex: number;
-  havingIndex: number;
-  qualifyIndex: number;
-  windowIndex: number;
-  orderByIndex: number;
-  limitIndex: number;
-  offsetIndex: number;
-  fetchIndex: number;
-}
+] as const satisfies readonly SqlDialect[];
 
 const DIALECTS_WITH_QUALIFY = new Set<SqlDialect>(['bigquery', 'snowflake', 'redshift']);
 const DIALECTS_WITH_WINDOW_CLAUSE = new Set<SqlDialect>([
@@ -849,18 +754,6 @@ const parseCteDefinitions = (sql: string) => {
 
   return definitions;
 };
-
-interface StatementEnvelope {
-  statementType: SqlAnalysis['statementType'];
-  statementLabel: string;
-  writeTarget?: string;
-  writeTargetAlias?: string;
-  graphSql: string;
-  mode: 'select' | 'update-from' | 'merge';
-  updateSetClause?: string;
-  mergeUsingClause?: string;
-  mergeOnClause?: string;
-}
 
 const findSelectEnvelope = (sql: string): StatementEnvelope => ({
   statementType: 'select',

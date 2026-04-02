@@ -238,6 +238,29 @@ input:focus-visible {
   line-height: 1.45;
 }
 
+.review-banner {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(240, 211, 138, 0.42);
+  background: rgba(240, 211, 138, 0.06);
+}
+
+.review-banner strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.review-banner span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.review-banner button {
+  justify-self: start;
+}
+
 .editor-actions button,
 .canvas-toolbar__controls button,
 .statement-item {
@@ -1561,6 +1584,14 @@ input:focus-visible {
   line-height: 1.55;
 }
 
+.note-input--summary {
+  min-height: 120px;
+}
+
+.note-input--compact {
+  min-height: 88px;
+}
+
 .inspector-note {
   color: var(--muted-soft);
   font-size: 11px;
@@ -1600,7 +1631,7 @@ input:focus-visible {
 
 .rail-tabs {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 8px;
   margin-top: 12px;
 }
@@ -1661,6 +1692,110 @@ input:focus-visible {
   color: #d6e6ff;
   font-size: 11px;
   line-height: 1.4;
+}
+
+.review-panel {
+  display: grid;
+  gap: 18px;
+  align-content: start;
+}
+
+.review-section {
+  display: grid;
+  gap: 10px;
+}
+
+.review-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.review-status {
+  border: 1px solid var(--border);
+  background: #000;
+  color: var(--text);
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.review-status.is-active {
+  background: #141414;
+}
+
+.review-status:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.review-status--good {
+  border-color: rgba(168, 213, 162, 0.55);
+}
+
+.review-status--review {
+  border-color: rgba(255, 138, 138, 0.5);
+}
+
+.guidance-list,
+.flag-review-list,
+.comment-list {
+  display: grid;
+  gap: 10px;
+}
+
+.guidance-card,
+.comment-card {
+  border: 1px solid var(--border-soft);
+  background: #070707;
+  padding: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.guidance-card--high {
+  border-color: rgba(255, 138, 138, 0.4);
+}
+
+.guidance-card--medium {
+  border-color: rgba(240, 211, 138, 0.4);
+}
+
+.guidance-card--low {
+  border-color: rgba(168, 213, 162, 0.35);
+}
+
+.guidance-card__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.guidance-card strong,
+.comment-card strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.guidance-card__head span {
+  color: var(--muted-soft);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.guidance-card p,
+.comment-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.guidance-card small {
+  color: #d6e6ff;
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .shortcut-overlay {
